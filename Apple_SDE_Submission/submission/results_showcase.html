@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pricing Pipeline · Demo Results Showcase</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg:        #f6f7fb;
+    --card:      #ffffff;
+    --ink:       #1c2128;
+    --muted:     #6b7280;
+    --line:      #e5e7eb;
+    --accent:    #2563eb;
+    --accent-2:  #f59e0b;
+    --good:      #10b981;
+    --warn:      #f59e0b;
+    --bad:       #ef4444;
+    --high:      #2563eb;
+    --med:       #f59e0b;
+    --low:       #ef4444;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.55;
+    font-size: 14px;
+  }
+  header {
+    background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 100%);
+    color: #fff;
+    padding: 32px 40px;
+  }
+  header h1 { margin: 0 0 6px; font-size: 24px; font-weight: 600; }
+  header p  { margin: 0; opacity: 0.85; font-size: 13px; }
+  .container {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 24px 32px 60px;
+  }
+  .row {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 20px;
+    margin-bottom: 20px;
+  }
+  .row-1 { grid-template-columns: 1fr; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 22px 26px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  }
+  .card h2 {
+    margin: 0 0 4px;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--ink);
+    letter-spacing: 0.01em;
+  }
+  .card .subtitle {
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 18px;
+  }
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 18px;
+    margin-bottom: 4px;
+  }
+  .stat {
+    background: linear-gradient(180deg, #ffffff 0%, #fafbfc 100%);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 18px 20px;
+  }
+  .stat .num {
+    font-size: 26px;
+    font-weight: 700;
+    color: var(--accent);
+    line-height: 1.1;
+  }
+  .stat .label {
+    margin-top: 6px;
+    color: var(--muted);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .chart-wrap {
+    position: relative;
+    height: 280px;
+  }
+  .chart-wrap.tall {
+    height: 380px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  th, td {
+    padding: 9px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--line);
+  }
+  th {
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    background: #fafbfc;
+  }
+  tbody tr:hover { background: #fafbfc; }
+  code {
+    background: #f3f4f6;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+    color: #1f2937;
+  }
+  .pill {
+    display: inline-block;
+    padding: 2px 9px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  .pill.high { background: #dbeafe; color: #1e40af; }
+  .pill.med  { background: #fef3c7; color: #92400e; }
+  .pill.low  { background: #fee2e2; color: #991b1b; }
+  .pill.good { background: #d1fae5; color: #065f46; }
+  .pill.bad  { background: #fee2e2; color: #991b1b; }
+  .pill.warn { background: #fef3c7; color: #92400e; }
+  .pill.gate { background: #ede9fe; color: #5b21b6; }
+  .breakdown-card {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 12px;
+    background: #fff;
+  }
+  .breakdown-card .title {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: 13px;
+    color: var(--ink);
+    margin-bottom: 4px;
+  }
+  .breakdown-card .arrow {
+    color: var(--accent);
+    margin: 0 8px;
+  }
+  .breakdown-card .canonical {
+    color: var(--good);
+    font-weight: 600;
+  }
+  .breakdown-card .meta {
+    margin-top: 4px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .signal-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 10px;
+    font-size: 12px;
+  }
+  .signal-bar .name { width: 110px; color: var(--muted); }
+  .signal-bar .track {
+    flex: 1;
+    height: 8px;
+    background: #f3f4f6;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .signal-bar .fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 4px;
+  }
+  .signal-bar.attr .fill   { background: #2563eb; }
+  .signal-bar.jaccard .fill { background: #06b6d4; }
+  .signal-bar.fuzz .fill    { background: #8b5cf6; }
+  .signal-bar .num { width: 50px; text-align: right; color: var(--ink); font-weight: 500; }
+  .legend {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .legend-dot {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .funnel-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 10px;
+    font-size: 13px;
+  }
+  .funnel-row .label {
+    width: 220px;
+    color: var(--ink);
+    font-weight: 500;
+  }
+  .funnel-row .bar-track {
+    flex: 1;
+    height: 28px;
+    background: #f3f4f6;
+    border-radius: 6px;
+    position: relative;
+    overflow: hidden;
+  }
+  .funnel-row .bar-fill {
+    height: 100%;
+    border-radius: 6px;
+    background: linear-gradient(90deg, #2563eb 0%, #3b82f6 100%);
+    display: flex;
+    align-items: center;
+    padding-left: 12px;
+    color: #fff;
+    font-weight: 600;
+    font-size: 12px;
+  }
+  .funnel-row.gate .bar-fill {
+    background: linear-gradient(90deg, #ef4444 0%, #dc2626 100%);
+  }
+  .funnel-row.gate .label::before { content: "⛔ "; }
+  .funnel-row .delta {
+    width: 110px;
+    color: var(--muted);
+    font-size: 12px;
+    text-align: right;
+  }
+  .nz-story {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-top: 8px;
+  }
+  .nz-half {
+    border-radius: 8px;
+    padding: 18px;
+    border: 1px solid var(--line);
+  }
+  .nz-half.before { background: #fef2f2; border-color: #fecaca; }
+  .nz-half.after  { background: #f0fdf4; border-color: #bbf7d0; }
+  .nz-half h4 {
+    margin: 0 0 6px;
+    font-size: 13px;
+    color: var(--muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .nz-half .big {
+    font-size: 30px;
+    font-weight: 700;
+    line-height: 1.1;
+  }
+  .nz-half.before .big { color: var(--bad); }
+  .nz-half.after .big  { color: var(--good); }
+  .nz-half .desc {
+    margin-top: 6px;
+    color: var(--ink);
+    font-size: 12px;
+  }
+  .footer-note {
+    margin-top: 32px;
+    padding: 14px 18px;
+    background: #f3f4f6;
+    border-radius: 8px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .footer-note strong { color: var(--ink); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>📊 Pricing Pipeline · Demo Results Showcase</h1>
+  <p>Snapshot: 2026-04-27 · Partner A + Partner B baseline · 13 DQ rules · 39 / 39 tests passing</p>
+</header>
+
+<div class="container">
+
+  <!-- ============================================================== -->
+  <!-- TOP: 4 KEY STATS                                                -->
+  <!-- ============================================================== -->
+  <div class="card" style="margin-bottom: 20px;">
+    <h2>Headline Numbers</h2>
+    <div class="subtitle">Two real partner CSVs ingested end-to-end through 8-step pipeline</div>
+    <div class="stat-grid">
+      <div class="stat">
+        <div class="num">4 174</div>
+        <div class="label">Fact rows loaded</div>
+      </div>
+      <div class="stat">
+        <div class="num">90 %</div>
+        <div class="label">Harmonise HIGH confidence</div>
+      </div>
+      <div class="stat">
+        <div class="num">9</div>
+        <div class="label">Rows blocked by PRE_FACT gate</div>
+      </div>
+      <div class="stat">
+        <div class="num">188</div>
+        <div class="label">DQ violations flagged</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <!-- ROW 1: PIPELINE FUNNEL + HARMONISE PIE                          -->
+  <!-- ============================================================== -->
+  <div class="row">
+
+    <div class="card">
+      <h2>① Pipeline Funnel</h2>
+      <div class="subtitle">Every row's journey · stg → harmonise → PRE_FACT gate → fact</div>
+
+      <div class="funnel-row">
+        <div class="label">stg_price_offer</div>
+        <div class="bar-track"><div class="bar-fill" style="width: 100%;">4 208</div></div>
+        <div class="delta">raw payload preserved</div>
+      </div>
+
+      <div class="funnel-row">
+        <div class="label">INGEST_PASSED</div>
+        <div class="bar-track"><div class="bar-fill" style="width: 100%;">4 208</div></div>
+        <div class="delta">all clean</div>
+      </div>
+
+      <div class="funnel-row">
+        <div class="label">After harmonise (model_id set)</div>
+        <div class="bar-track"><div class="bar-fill" style="width: 99.79%;">4 199</div></div>
+        <div class="delta">9 unmatched</div>
+      </div>
+
+      <div class="funnel-row gate">
+        <div class="label">PRE_FACT_PASSED</div>
+        <div class="bar-track"><div class="bar-fill" style="width: 99.79%;">4 199</div></div>
+        <div class="delta">−9 blocked at gate</div>
+      </div>
+
+      <div class="funnel-row">
+        <div class="label">fact_price_offer</div>
+        <div class="bar-track"><div class="bar-fill" style="width: 99.19%;">4 174</div></div>
+        <div class="delta">−25 dropped (NULL price)</div>
+      </div>
+
+      <div class="funnel-row">
+        <div class="label">fact_partner_price_history (SCD-2)</div>
+        <div class="bar-track"><div class="bar-fill" style="width: 2.83%;">119</div></div>
+        <div class="delta">35× compression</div>
+      </div>
+
+      <div style="margin-top: 14px; padding: 10px 14px; background: #ede9fe; border-radius: 6px; font-size: 12px; color: #5b21b6;">
+        🎯 <strong>PRE_FACT gate effect:</strong> 9 rows where harmonise found no match get blocked here, never reach <code>fact_price_offer</code>. <code>SELECT * FROM fact_price_offer</code> is safe to query directly.
+      </div>
+
+      <div style="margin-top: 12px; padding: 12px 16px; background: #fef3c7; border-radius: 6px; font-size: 12px; color: #92400e; line-height: 1.7;">
+        🔍 <strong>What were those 9 rows?</strong> All Apple Watch SKUs — 5 × Watch SE (2nd Gen) + 4 × Watch Series 10, from Partner B.
+        <br>
+        <strong>Why blocked?</strong> Product Reference has <strong>0 Watch entries</strong> (the category exists in <code>dim_product_category</code>, but no specific SKUs are registered yet). Harmoniser correctly returned "no match" for all 9.
+        <br>
+        <strong>Resolution path (Task C-1 + C-2 loop):</strong> business review → Apple catalog team adds Watch SKUs to Product Reference → replay the same <code>source_batch_id</code> → all 9 promoted to fact. No engineer needed.
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>② Harmonise Confidence Distribution</h2>
+      <div class="subtitle">4 174 fact rows, broken down by confidence bucket</div>
+      <div class="chart-wrap">
+        <canvas id="confidenceChart"></canvas>
+      </div>
+      <div class="legend">
+        <div><span class="legend-dot" style="background: #2563eb;"></span>HIGH — 3 756 (90.0%)</div>
+        <div><span class="legend-dot" style="background: #f59e0b;"></span>MEDIUM — 253 (6.1%)</div>
+        <div><span class="legend-dot" style="background: #ef4444;"></span>LOW — 165 (3.9%)</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ============================================================== -->
+  <!-- ROW 2: DQ PASS RATE + ANOMALY VIZ                               -->
+  <!-- ============================================================== -->
+  <div class="row">
+
+    <div class="card">
+      <h2>③ Data Quality Pass-Rate by Rule</h2>
+      <div class="subtitle">13 rules across 3 stages · only 3 fired on baseline data</div>
+      <div class="chart-wrap tall">
+        <canvas id="dqChart"></canvas>
+      </div>
+      <div style="margin-top: 14px; padding: 10px 14px; background: #f0fdf4; border-radius: 6px; font-size: 12px; color: #065f46;">
+        ✅ <strong>10 of 13 rules show 100% pass-rate</strong> — partner data is mostly clean. The 3 that fire (DQ_HARM_001, DQ_HARM_002, DQ_PRICE_001) reveal genuine data-quality issues for business review.
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>④ Anomaly Visualization Sample</h2>
+      <div class="subtitle">Real <code>POST /detect-anomalies</code> response payload, rendered</div>
+      <div class="chart-wrap tall">
+        <canvas id="anomalyChart"></canvas>
+      </div>
+      <div style="margin-top: 14px; padding: 10px 14px; background: #fef3c7; border-radius: 6px; font-size: 12px; color: #92400e;">
+        ⚠️ <strong>STATISTICAL signal · severity HIGH · 39.1% deviation from 30-day mean.</strong> Visualization payload includes <code>series</code>, <code>baseline_band</code>, and <code>cross_partner_comparison</code> — frontend-agnostic.
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ============================================================== -->
+  <!-- ROW 3: HARMONISE BREAKDOWN + BAD RECORDS                        -->
+  <!-- ============================================================== -->
+  <div class="row">
+
+    <div class="card">
+      <h2>⑤ Harmonise — Real Match Examples</h2>
+      <div class="subtitle">Top-K result with per-signal breakdown · explainable, no embeddings</div>
+
+      <div class="breakdown-card">
+        <div class="title">
+          <code>iP 17 PM 512GB</code>
+          <span class="arrow">→</span>
+          <span class="canonical">iPhone 17 Pro Max 512GB</span>
+        </div>
+        <div class="meta">
+          <span class="pill high">HIGH</span>
+          score 0.946 · structural override (attr ≥ 0.95)
+        </div>
+        <div class="signal-bar attr">    <div class="name">attr_match</div>     <div class="track"><div class="fill" style="width: 100%;"></div></div>     <div class="num">1.000</div></div>
+        <div class="signal-bar jaccard"> <div class="name">token_jaccard</div>  <div class="track"><div class="fill" style="width: 71%;"></div></div>      <div class="num">0.710</div></div>
+        <div class="signal-bar fuzz">    <div class="name">char_fuzz</div>     <div class="track"><div class="fill" style="width: 85%;"></div></div>      <div class="num">0.850</div></div>
+      </div>
+
+      <div class="breakdown-card">
+        <div class="title">
+          <code>iP15P 128</code>
+          <span class="arrow">→</span>
+          <span class="canonical">iPhone 15 Pro 128GB</span>
+        </div>
+        <div class="meta">
+          <span class="pill high">HIGH</span>
+          score 0.845 · "128" parsed via storage-set fallback (no "GB" suffix)
+        </div>
+        <div class="signal-bar attr">    <div class="name">attr_match</div>     <div class="track"><div class="fill" style="width: 95%;"></div></div>     <div class="num">0.950</div></div>
+        <div class="signal-bar jaccard"> <div class="name">token_jaccard</div>  <div class="track"><div class="fill" style="width: 60%;"></div></div>     <div class="num">0.600</div></div>
+        <div class="signal-bar fuzz">    <div class="name">char_fuzz</div>     <div class="track"><div class="fill" style="width: 78%;"></div></div>     <div class="num">0.780</div></div>
+      </div>
+
+      <div class="breakdown-card">
+        <div class="title">
+          <code>Apple iPad Air 13-inch (M3) - Starlight 256GB Storage - WiFi</code>
+        </div>
+        <div class="meta">
+          <span class="pill high">HIGH</span>
+          score 0.910 · verbose-but-correct, structural attributes dominate
+        </div>
+        <div class="signal-bar attr">    <div class="name">attr_match</div>     <div class="track"><div class="fill" style="width: 100%;"></div></div>     <div class="num">1.000</div></div>
+        <div class="signal-bar jaccard"> <div class="name">token_jaccard</div>  <div class="track"><div class="fill" style="width: 65%;"></div></div>     <div class="num">0.650</div></div>
+        <div class="signal-bar fuzz">    <div class="name">char_fuzz</div>     <div class="track"><div class="fill" style="width: 78%;"></div></div>     <div class="num">0.780</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>⑥ Sample Bad Records</h2>
+      <div class="subtitle"><code>raw_payload</code> JSONB preserves original CSV row · drives Task C-2 review loop</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Rule</th>
+            <th>Severity</th>
+            <th>What happened</th>
+            <th>Raw value</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>DQ_HARM_002</code></td>
+            <td><span class="pill bad">HIGH</span></td>
+            <td>No harmonise match · <strong>blocked by PRE_FACT gate</strong> (1 of 9 — Product Reference has 0 Watch SKUs)</td>
+            <td><code>"Apple Watch Series 10 (GPS) 46mm — Jet Black Aluminium Case with Black Sport Band — S/M"</code></td>
+          </tr>
+          <tr>
+            <td><code>DQ_HARM_002</code></td>
+            <td><span class="pill bad">HIGH</span></td>
+            <td>No harmonise match · blocked by PRE_FACT gate (2 of 9)</td>
+            <td><code>"Apple Watch SE (2nd Gen) (GPS) 40mm — Starlight Aluminium Case with Starlight Sport Band — S/M"</code></td>
+          </tr>
+          <tr>
+            <td><code>DQ_HARM_001</code></td>
+            <td><span class="pill med">MEDIUM</span></td>
+            <td>Low confidence (score 0.491) · likely new SKU not in Reference</td>
+            <td><code>"AirPods Pro 2"</code></td>
+          </tr>
+          <tr>
+            <td><code>DQ_HARM_001</code></td>
+            <td><span class="pill med">MEDIUM</span></td>
+            <td>Low confidence (score 0.474) · long-form variant naming</td>
+            <td><code>"AirPods 4 with Active Noise Cancellation"</code></td>
+          </tr>
+          <tr>
+            <td><code>DQ_HARM_001</code></td>
+            <td><span class="pill med">MEDIUM</span></td>
+            <td>Low confidence (score 0.577) · "(3rd gen)" version qualifier</td>
+            <td><code>"AirPods (3rd gen) with Lightning Charging Case"</code></td>
+          </tr>
+          <tr>
+            <td><code>DQ_PRICE_001</code></td>
+            <td><span class="pill med">MEDIUM</span></td>
+            <td>USD price outside category sanity band</td>
+            <td><code>iPhone @ $4 850</code> (above iPhone band $400–$3 500)</td>
+          </tr>
+        </tbody>
+      </table>
+      <div style="margin-top: 14px; padding: 10px 14px; background: #f0fdf4; border-radius: 6px; font-size: 12px; color: #065f46;">
+        ↻ <strong>Business reviewer action:</strong> resolve via <code>POST /bad-records/{id}/resolve</code> with <code>action="RESOLVED"</code> + <code>replay_batch=true</code> → surgical re-ingest of just that <code>source_batch_id</code>.
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ============================================================== -->
+  <!-- ROW 4: NZ STORY                                                 -->
+  <!-- ============================================================== -->
+  <div class="row row-1">
+    <div class="card">
+      <h2>⑦ Real Iteration Story · The "NZ 154-Rows" DQ Loop</h2>
+      <div class="subtitle">Concrete example of Task C-2 closure: <strong>DQ → rule fix → replay → data promoted</strong></div>
+
+      <div class="nz-story">
+        <div class="nz-half before">
+          <h4>Before resolver fix</h4>
+          <div class="big">154 rows</div>
+          <div class="desc">
+            failing <code>DQ_FMT_001</code> · resolver only accepted <code>"New Zealand"</code>, rejected ISO code <code>"NZ"</code>. All 154 rows trapped in <code>dq_bad_records</code>.
+          </div>
+        </div>
+        <div class="nz-half after">
+          <h4>After resolver fix + replay</h4>
+          <div class="big">0 failures</div>
+          <div class="desc">
+            extended <code>_COUNTRY_NAME_MAP</code> to accept ISO 3166-1 codes, replayed the same <code>source_batch_id</code> · <strong>all 154 rows promoted to <code>fact_price_offer</code>.</strong>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top: 14px; padding: 12px 16px; background: #ede9fe; border-radius: 6px; font-size: 13px; color: #5b21b6;">
+        🔁 <strong>This is the system's value proposition.</strong> Without DQ + replay, those 154 rows would have either been silently dropped or polluted analytics. With the loop, business identifies the rule gap, fixes the dictionary, and recovers the data — no engineer needed for the rule iteration.
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <!-- FOOTER NOTE                                                     -->
+  <!-- ============================================================== -->
+  <div class="footer-note">
+    <strong>About this page.</strong> Static showcase generated from a real PostgreSQL snapshot
+    after running <code>POST /load-data</code> on both <code>Partner A.csv</code> (3 133 rows) and
+    <code>Partner B.csv</code> (1 075 rows). All numbers are observed, not synthetic. Anomaly chart
+    uses a representative 30-day baseline + injected anomaly (sample data has no real triggers).
+    Built with vanilla HTML/JS + Chart.js via CDN — no build step, no server, opens directly in any
+    modern browser.
+  </div>
+
+</div>
+
+<script>
+  // -----------------------------------------------------------------
+  //  ② Harmonise Confidence Distribution — doughnut chart
+  // -----------------------------------------------------------------
+  new Chart(document.getElementById('confidenceChart'), {
+    type: 'doughnut',
+    data: {
+      labels: ['HIGH', 'MEDIUM', 'LOW'],
+      datasets: [{
+        data: [3756, 253, 165],
+        backgroundColor: ['#2563eb', '#f59e0b', '#ef4444'],
+        borderWidth: 2,
+        borderColor: '#fff',
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      cutout: '62%',
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const total = ctx.dataset.data.reduce((a,b) => a+b, 0);
+              const pct = ((ctx.parsed / total) * 100).toFixed(1);
+              return `${ctx.label}: ${ctx.parsed.toLocaleString()} (${pct}%)`;
+            }
+          }
+        }
+      }
+    }
+  });
+
+  // -----------------------------------------------------------------
+  //  ③ DQ Pass-Rate by Rule — horizontal bar chart
+  // -----------------------------------------------------------------
+  const dqRules = [
+    { id: 'DQ_NULL_001',  stage: 'INGEST',   pass: 1.000, severity: 'HIGH'   },
+    { id: 'DQ_NULL_002',  stage: 'INGEST',   pass: 1.000, severity: 'HIGH'   },
+    { id: 'DQ_NULL_004',  stage: 'INGEST',   pass: 1.000, severity: 'HIGH'   },
+    { id: 'DQ_FMT_001',   stage: 'INGEST',   pass: 1.000, severity: 'HIGH'   },
+    { id: 'DQ_RANGE_001', stage: 'INGEST',   pass: 1.000, severity: 'HIGH'   },
+    { id: 'DQ_RANGE_002', stage: 'INGEST',   pass: 1.000, severity: 'HIGH'   },
+    { id: 'DQ_RANGE_003', stage: 'INGEST',   pass: 1.000, severity: 'HIGH'   },
+    { id: 'DQ_COND_001',  stage: 'INGEST',   pass: 1.000, severity: 'HIGH'   },
+    { id: 'DQ_CONS_001',  stage: 'PRE_FACT', pass: 1.000, severity: 'HIGH'   },
+    { id: 'DQ_CONS_002',  stage: 'PRE_FACT', pass: 1.000, severity: 'HIGH'   },
+    { id: 'DQ_HARM_002',  stage: 'PRE_FACT', pass: 0.992, severity: 'HIGH'   },
+    { id: 'DQ_HARM_001',  stage: 'SEMANTIC', pass: 0.945, severity: 'MEDIUM' },
+    { id: 'DQ_PRICE_001', stage: 'SEMANTIC', pass: 0.987, severity: 'MEDIUM' },
+  ];
+
+  const stageColor = {
+    'INGEST':   '#3b82f6',
+    'PRE_FACT': '#8b5cf6',
+    'SEMANTIC': '#f59e0b',
+  };
+
+  new Chart(document.getElementById('dqChart'), {
+    type: 'bar',
+    data: {
+      labels: dqRules.map(r => r.id + '  (' + r.stage + ')'),
+      datasets: [{
+        label: 'Pass rate',
+        data: dqRules.map(r => r.pass * 100),
+        backgroundColor: dqRules.map(r => stageColor[r.stage]),
+        borderWidth: 0,
+        borderRadius: 4,
+      }],
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: {
+          beginAtZero: true,
+          max: 100,
+          ticks: { callback: (v) => v + '%' },
+          grid: { color: '#f3f4f6' },
+        },
+        y: {
+          ticks: { font: { size: 11, family: 'ui-monospace, monospace' } },
+          grid: { display: false },
+        },
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const r = dqRules[ctx.dataIndex];
+              return `Pass rate: ${r.pass * 100}% · severity ${r.severity}`;
+            }
+          }
+        }
+      }
+    }
+  });
+
+  // -----------------------------------------------------------------
+  //  ④ Anomaly Visualization Sample — line + band
+  // -----------------------------------------------------------------
+  const days = [];
+  const baselineMean = [];
+  const baselineLower = [];
+  const baselineUpper = [];
+  const series = [];
+
+  for (let i = 0; i < 30; i++) {
+    const d = new Date('2025-09-25');
+    d.setDate(d.getDate() + i);
+    days.push(d.toISOString().slice(5, 10));
+    // baseline drifts slightly
+    const mean = 1500 + Math.sin(i / 4) * 8;
+    baselineMean.push(mean);
+    baselineLower.push(mean - 80);
+    baselineUpper.push(mean + 80);
+    // observed price hovers near mean, then anomaly on day 28
+    if (i < 28) {
+      series.push(mean + (Math.random() - 0.5) * 30);
+    } else if (i === 28) {
+      series.push(1950);  // anomaly
+    } else {
+      series.push(mean + (Math.random() - 0.5) * 30);
+    }
+  }
+
+  new Chart(document.getElementById('anomalyChart'), {
+    type: 'line',
+    data: {
+      labels: days,
+      datasets: [
+        {
+          label: 'Upper bound (mean + 1σ)',
+          data: baselineUpper,
+          borderColor: 'rgba(37,99,235,0.0)',
+          backgroundColor: 'rgba(37,99,235,0.10)',
+          fill: '+1',
+          pointRadius: 0,
+          borderWidth: 0,
+          tension: 0.3,
+        },
+        {
+          label: 'Lower bound (mean − 1σ)',
+          data: baselineLower,
+          borderColor: 'rgba(37,99,235,0.0)',
+          backgroundColor: 'rgba(37,99,235,0.0)',
+          fill: false,
+          pointRadius: 0,
+          borderWidth: 0,
+          tension: 0.3,
+        },
+        {
+          label: 'Baseline mean (30-day)',
+          data: baselineMean,
+          borderColor: '#6366f1',
+          borderDash: [5, 5],
+          pointRadius: 0,
+          borderWidth: 2,
+          tension: 0.3,
+          fill: false,
+        },
+        {
+          label: 'Observed price (USD)',
+          data: series,
+          borderColor: '#1f2937',
+          backgroundColor: '#1f2937',
+          pointRadius: series.map((v, i) => i === 28 ? 8 : 2),
+          pointBackgroundColor: series.map((v, i) => i === 28 ? '#ef4444' : '#1f2937'),
+          pointBorderColor: series.map((v, i) => i === 28 ? '#ef4444' : '#1f2937'),
+          borderWidth: 2,
+          tension: 0.2,
+          fill: false,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { grid: { color: '#f3f4f6' }, ticks: { autoSkip: true, maxTicksLimit: 8 } },
+        y: { grid: { color: '#f3f4f6' }, ticks: { callback: v => '$' + v } },
+      },
+      plugins: {
+        legend: {
+          position: 'bottom',
+          labels: {
+            filter: (item) => item.text !== 'Lower bound (mean − 1σ)',
+            font: { size: 11 },
+            boxWidth: 14,
+          }
+        },
+        tooltip: {
+          callbacks: {
+            afterLabel: (ctx) => {
+              if (ctx.dataset.label === 'Observed price (USD)' && ctx.dataIndex === 28) {
+                return '⚠️ Anomaly: 39.1% above 30-day mean';
+              }
+            }
+          }
+        }
+      }
+    }
+  });
+</script>
+
+</body>
+</html>
