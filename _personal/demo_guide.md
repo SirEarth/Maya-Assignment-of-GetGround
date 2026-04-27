@@ -93,59 +93,88 @@ curl -X POST http://localhost:8000/load-data -F "file=@Partner B.csv" -F "partne
 
 **目标:** 让面试官**看到**整个流水线在真 DB 上跑通。**全程在浏览器里用 Swagger UI 操作**,无需切 terminal 跑 curl。
 
-### 2a · 打开 Swagger UI,介绍 8 个端点
+### 2a · 打开 Swagger UI,介绍 9 个端点 + 双路径
 
 浏览器打开 `http://localhost:8000/docs`,**从上往下滚一遍**,简短说明每个端点:
 
 ```
-POST /load-data                       ← 主入口,本节 demo 用到
+[Path A — 一键编排]
+POST /pipeline                        ← orchestrator,9 步流水线一键跑
+
+[Path B — Task B 4 个独立子模块]
+POST /load-data                       ← Task B-1: parse + harmonise + 写 fact (no gate)
 GET  /load-data/{job_id}              ← 异步进度查询
-POST /compute-dq                      ← Task B-2
-POST /detect-anomalies                ← Task B-3
-GET  /harmonise-product               ← Task B-4
+POST /compute-dq                      ← Task B-2: 13 条 DQ → 2 张表
+POST /detect-anomalies                ← Task B-3: 异常检测 + visualization
+GET  /harmonise-product               ← Task B-4: 单条 harmonise
+
+[支撑端点]
 GET  /bad-records                     ← Task C-2 业务审核
 POST /bad-records/{id}/resolve        ← 解决/标记 bad record
 GET  /health                          ← Liveness probe
 ```
 
 **台词:**
-> *"All 8 endpoints exposed behind Swagger UI — 4 from the assignment plus 4 supporting endpoints for async job polling and the business-user review workflow. Pydantic 2 schemas auto-generate this spec; nothing handwritten."*
+> *"Two call paths sharing the same 9 internal step helpers. **Path A `/pipeline`** is the one-click orchestrator — runs the full pipeline end-to-end with a hard PRE_FACT gate that blocks bad rows from `fact_price_offer`. **Path B** is the 4 Task-B sub-modules — each independently callable; same 9 steps but the gate degrades to post-hoc flagging. Both paths call the same Python helpers — zero duplication. Path A trades flexibility for stronger guarantees; Path B trades guarantees for granular control."*
 >
-> **中文备注:** 4 个题目要求的 + 4 个支撑端点;Pydantic 2 自动生成 spec,无手写。
+> **中文备注:** 两条路径共用 9 个内部 helper。Path A `/pipeline` 一键编排带硬 gate;Path B 是 Task B 要求的 4 个独立子模块,gate 退化为事后标记。零代码重复。
 
-### 2b · 在 Swagger UI 上传 Partner A.csv
+### 2b · Partner A 走 Path A — `POST /pipeline`(一键 9 步)
 
-1. 点击 **`POST /load-data`** 展开
+**故意用 Path A 演示一键流水线 + 硬 gate**:
+
+1. 点击 **`POST /pipeline`** 展开
 2. 点右上角 **"Try it out"** 进入交互模式
-3. **`file`** 字段点 **"Choose File"** → 选 `Apple SDE/Partner A.csv`
-4. **`partner_code`** 输入框填 `PARTNER_A`
-5. 点蓝色 **"Execute"** 按钮
+3. **`file`** 字段 → 选 `Apple SDE/Partner A.csv`
+4. **`partner_code`** 填 `PARTNER_A`
+5. 点蓝色 **"Execute"**
 
-下方 **Response** 面板会出现 JSON,**HTTP 202** + 内容:
+响应是 **HTTP 200** + 聚合结果(单次返回就包含 dq + anomaly):
 
 ```json
 {
   "job_id": "...",
   "source_batch_id": "<UUID>",
-  "status": "COMPLETED",
+  "rows_loaded": 3108,
+  "rows_bad": 106,
+  "dq_summary": { "total_violations": 106, "by_severity": {...} },
+  "anomalies_total": ...,
   ...
 }
 ```
 
-**复制 `source_batch_id` 的 UUID** —— 在 [`demo_queries.sql`](demo_queries.sql) 里 `Cmd+F`(macOS)/`Ctrl+F` 找 `<BATCH_ID>` 全部替换为这个 UUID。
+**复制 `source_batch_id`** —— 一会儿在 §2d highlight。
 
-### 2c · 接着上传 Partner B.csv,讲 NZ 故事
+**台词:**
+> *"One call, full 9-step pipeline inside a single Postgres transaction. `rows_loaded=3108`, `rows_bad=106` — those 106 PRE_FACT-failing rows are blocked from `fact_price_offer`. The fact table for this batch is **trustworthy by construction**; downstream analytics can hit it directly without filter views. This is Path A's contract."*
 
-同一个 `POST /load-data`,改:
-- **`file`** → `Partner B.csv`
-- **`partner_code`** → `PARTNER_B`
+### 2c · Partner B 走 Path B — 三步分调,讲 NZ 故事 + 事后标记
 
-点 **Execute** 再上传一次。
+**故意用 Path B 让面试官看到子模块独立可调 + 标记语义对比**:
 
-**台词(NZ 故事):**
-> *"Partner B has 154 rows where `COUNTRY_VAL` is the ISO code `'NZ'` instead of `'New Zealand'`. An earlier `DQ_FMT_001` only accepted full names — those 154 rows failed Ingest DQ. The fix was to extend the resolver to accept both forms; replay the same `source_batch_id`, those 154 rows promoted into fact. **Real example of the DQ → rule iteration → replay loop, the C-2 deliverable in action.**"*
+**Step 1** — `POST /load-data`(只 load,不跑 DQ)
+- **`file`** → `Partner B.csv` / **`partner_code`** → `PARTNER_B` → **Execute**
+- 复制响应里的 `source_batch_id`
+
+**Step 2** — `POST /compute-dq`(独立跑 DQ)
+- Request body:
+```json
+{ "source_batch_id": "<刚才复制的>" }
+```
+- 响应展示 13 条规则 pass-rate + 各 severity 命中数
+
+**Step 3** — `POST /detect-anomalies`(独立跑异常检测)
+- Request body:
+```json
+{ "source_batch_id": "<上面同一个>", "min_severity": "MEDIUM" }
+```
+
+**台词(双重对比):**
+> *"Path B is the 4 Task-B sub-modules called individually — what the assignment literally specified. **Critical contrast with Path A**: in Path B, `/load-data` writes everything to fact BEFORE DQ runs, so `/compute-dq` flags bad rows post-hoc — they stay in `fact_price_offer` with a marker in `dq_bad_records`. Analytics queries on Path B's fact need `LEFT JOIN dq_bad_records WHERE bad_record_id IS NULL` to filter them out. This is the price of decoupling — and it's why `/pipeline` exists as the alternative for production."*
 >
-> **中文备注:** Partner B 154 行 NZ 故事 — 早期 DQ_FMT_001 只认全称;修了后 replay,行干净进 fact。Task C-2 闭环的真实案例。
+> **NZ 故事(同时讲):** *"Partner B has 154 rows where COUNTRY_VAL is `'NZ'` instead of `'New Zealand'`. Earlier `DQ_FMT_001` only accepted full names — those 154 failed. The fix was a one-line dictionary extension; replay the same `source_batch_id` and they promote into fact. Real example of the DQ → rule iteration → replay loop, Task C-2 in action."*
+>
+> **中文备注:** Path B 三步分调 = Task B 字面要求;关键对比是 fact 表"事后标记"vs Path A 的"硬 gate"。NZ 154 行是 DQ → 规则迭代 → replay 闭环的真实例子。
 
 ### 2d · 切到浏览器,打开 [`results_showcase.html`](../Apple%20SDE/submission/results_showcase.html) 走 **7 张可视化卡片**
 
@@ -193,18 +222,26 @@ open "Apple SDE/submission/results_showcase.html"
 ┌────────────────────────────────────────────────────────────────────┐
 │  API Layer · FastAPI + Pydantic 2 (api/main.py)                   │
 │                                                                    │
-│   /load-data    /compute-dq    /detect-anomalies                  │
-│   /harmonise-*  /bad-records   /load-data/{id}                    │
+│   ▸ Path A (orchestrator):  POST /pipeline                         │
+│   ▸ Path B (Task B 子模块): /load-data /compute-dq                 │
+│                              /detect-anomalies /harmonise-product  │
+│   ▸ 支撑端点:                /bad-records, /load-data/{id}, /health│
 └──────────────────────────────┬─────────────────────────────────────┘
-                               │
+                               │ 两条路径都调下面同一组 helper
                                ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │  Service Layer · Async Python (api/services.py)                    │
-│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐    │
-│  │  Harmoniser  │  │ DQ runtime   │  │ Anomaly detector       │    │
-│  │ (in-memory   │  │ (calls SQL   │  │ (statistical baseline  │    │
-│  │  Top-K)      │  │  functions)  │  │  + visualization)      │    │
-│  └──────────────┘  └──────────────┘  └────────────────────────┘    │
+│                                                                    │
+│  9 step helpers (共享):                                             │
+│   1. parse_csv_to_stg            6. run_semantic_dq                │
+│   2. run_ingest_dq               7. update_scd2                    │
+│   3. harmonise_in_stg            8. detect_anomalies_for_batch     │
+│   4. run_prefact_dq              9. write_batch_summary            │
+│   5. write_stg_to_fact(gate=…)                                     │
+│                                                                    │
+│  Service entry points:  run_pipeline (Path A) /                    │
+│                          submit_load_job · compute_dq_service ·    │
+│                          detect_anomalies_service (Path B)         │
 └──────────────────────────────┬─────────────────────────────────────┘
                                │ asyncpg pool
                                ▼
@@ -213,9 +250,10 @@ open "Apple SDE/submission/results_showcase.html"
 │                                                                    │
 │  ▸ Dimensions (14):  dim_country / dim_partner / dim_product_*    │
 │                      dim_currency_rate_snapshot · dim_anomaly_*    │
-│  ▸ Facts (5):        fact_price_offer (CTI parent)                 │
+│  ▸ Facts (5):        fact_price_offer (Class Table Inheritance)   │
 │                      fact_payment_full_price · fact_payment_*      │
-│                      fact_partner_price_history (SCD-2)            │
+│                      fact_partner_price_history (Slowly Changing   │
+│                                                  Dimension Type 2) │
 │                      fact_anomaly                                  │
 │  ▸ DQ (3):           dq_rule_catalog (13 rules) · dq_output        │
 │                      dq_bad_records (workflow + raw_payload JSONB) │
@@ -224,14 +262,12 @@ open "Apple SDE/submission/results_showcase.html"
 ```
 
 **台词:**
-> *"Three-layer architecture. API layer is FastAPI — Pydantic schemas auto-generate the OpenAPI spec, no separate spec to maintain. Service layer holds pure-Python algorithms (the harmoniser singleton + the anomaly detector) and orchestrates SQL calls. Data layer is PostgreSQL with a 29-table star schema. asyncpg pool gives us concurrent queries without thread overhead."*
+> *"Three-layer architecture. The API layer offers two paths: an orchestrator endpoint `/pipeline` that runs all 9 steps end-to-end, and the 4 Task-B sub-modules that are independently callable. Both paths invoke the **same 9 helper functions** in the service layer — zero duplication, just different orchestration. Service layer holds pure-Python algorithms (harmoniser, anomaly detector) and orchestrates SQL calls. Data layer is PostgreSQL with a 29-table star schema. asyncpg pool gives us concurrent queries without thread overhead."*
 
-### 3b · 业务流程图(同步入库 8 步 + 异步异常检测)
+### 3b · 业务流程图(9 步 · 双路径)
 
 ```
-   ════════════ /load-data 同步入库 (单一 PostgreSQL 事务) ════════════
-
-   Partner CSV upload
+   Partner CSV upload + partner_code
            │
            ▼
    ┌─────────────────────┐
@@ -250,17 +286,22 @@ open "Apple SDE/submission/results_showcase.html"
               │
               ▼
    ┌─────────────────────┐
-   │ ④ PRE_FACT DQ (3)   │  ⚠️ HIGH 严重度 GATE
-   │  HIGH gate          │  country↔currency / partner↔country /
-   │                     │  harmonise unmatched
+   │ ④ PRE_FACT DQ (3)   │  HIGH 严重度规则:country↔currency /
+   │                     │  partner↔country / harmonise unmatched
    └──────────┬──────────┘
-              │ 失败行 → dq_bad_records,**不进 fact**
+              │ 失败行 → dq_bad_records
               │ 通过的标 dq_status='PRE_FACT_PASSED'
               ▼
    ┌─────────────────────┐
-   │ ⑤ Build facts       │  → fact_price_offer
-   │                     │  + fact_payment_full_price (CTI)
-   │                     │  + fact_payment_instalment   (CTI)
+   │ ⑤ write_stg_to_fact │  ⚠️ 关键分歧点:
+   │                     │
+   │  Path A: gate=True  │   只写 PRE_FACT_PASSED 行
+   │    → fact 干净       │   → fact_price_offer (Class Table
+   │                     │     Inheritance: full_price /
+   │                     │     instalment 子表)
+   │                     │
+   │  Path B: gate=False │   写所有可解析行(包括坏行)
+   │    → fact 含标记行   │   → 后续 LEFT JOIN dq_bad_records 过滤
    └──────────┬──────────┘
               │
               ▼
@@ -271,50 +312,40 @@ open "Apple SDE/submission/results_showcase.html"
               │ 失败行**留在 fact**,只进 dq_bad_records 标记
               ▼
    ┌─────────────────────┐
-   │ ⑦ SCD-2 update      │  单条 CTE: latest → existing →
-   │                     │  changed → closed → insert
+   │ ⑦ Slowly Changing   │  单条 CTE: latest → existing →
+   │   Dimension Type 2  │  changed → closed → insert
    │                     │  → fact_partner_price_history
    └──────────┬──────────┘
               │
               ▼
    ┌─────────────────────┐
-   │ ⑧ Batch summary     │  → dws_partner_dq_per_batch
+   │ ⑧ detect_anomalies  │  STATISTICAL signal (vs 30-day baseline)
+   │                     │  visualization payload (series + band)
    └──────────┬──────────┘
-              │ 事务 commit
+              │
               ▼
-   ════════════ 异步下游分支 (按需 / 调度触发) ════════════════════════
+   ┌─────────────────────┐
+   │ ⑨ Batch summary     │  → dws_partner_dq_per_batch
+   │                     │  (UPSERT,Path B 增量写入)
+   └─────────────────────┘
 
-   ┌─────────────────────────┐         ┌──────────────────────────┐
-   │ POST /detect-anomalies  │ ◄────── │ Cron / on-batch trigger  │
-   │ (multi-signal detector) │         └──────────────────────────┘
-   └────────────┬────────────┘
-                │  reads:
-                │   • fact_partner_price_history (历史基线)
-                │   • dws_product_price_baseline_1d (滚动统计)
-                │   • dim_anomaly_threshold (阈值配置)
-                │   • dim_market_event (suppression 窗口)
-                │
-                ▼
-   ┌─────────────────────────┐
-   │  4-signal scoring       │  STATISTICAL / TEMPORAL /
-   │                         │  CROSS_PARTNER / SKU_VARIANCE
-   │  (每信号独立分类)         │  独立 severity HIGH / MEDIUM / LOW
-   └────────────┬────────────┘
-                │ 每触发一信号 = fact_anomaly 一行
-                │ visualization payload(series + band + cross-partner)
-                ▼
-   ┌─────────────────────────┐         ┌──────────────────────────┐
-   │ fact_anomaly            │ ──────► │ dim_alert_policy 路由     │
-   │ + threshold_snapshot    │         │  HIGH  → Slack / Teams   │
-   │ + baseline_snapshot     │         │  MED   → Email digest    │
-   │ (replay-safe)           │         │  LOW   → UI only         │
-   └─────────────────────────┘         └──────────────────────────┘
+   ════════════ 双路径调用映射 ════════════════════════════════════════
+
+   Path A — POST /pipeline    单事务 9 步全跑,顺序: 1→2→3→4→5(gate)→6→7→8→9
+                              fact 干净;PRE_FACT 失败行不入 fact
+
+   Path B — 4 个子模块分调:
+     POST /load-data            步 1, 3, 5(no gate), 7
+     POST /compute-dq           步 2, 4, 6
+     POST /detect-anomalies     步 8
+     每个端点尾部 UPSERT 步 9 → 共同填满 summary 表
+                              fact 含坏行;LEFT JOIN dq_bad_records 过滤
 ```
 
 **台词:**
-> *"Eight steps inside one Postgres transaction — any failure rolls back the whole batch. Three DQ stages, three policies: INGEST stops at staging, PRE_FACT blocks factual errors from fact, SEMANTIC flags soft signals after fact write. Anomaly detection is a separate downstream call — it reads the loaded fact + history and writes to `fact_anomaly`, with `dim_alert_policy` routing to Slack / email by severity."*
+> *"9 steps shared by both paths. Path A `/pipeline` runs them inside a single Postgres transaction in interleaved order — INGEST DQ before harmonise, PRE_FACT before fact write, SEMANTIC after. The PRE_FACT gate at step 5 hard-blocks bad rows from `fact_price_offer`. Path B's 4 sub-modules cover the same 9 steps but grouped — `/load-data` does the load-related steps without DQ, `/compute-dq` does all 3 DQ stages post-hoc, `/detect-anomalies` runs the anomaly signal. Same code; different transactional boundaries; observable difference in fact-table cleanliness."*
 >
-> **中文备注:** 8 步同步在单一事务;事务 commit 后,Anomaly detector 作为异步下游(按需触发或定时跑)读 fact + 历史基线,产生异常记录路由到 Slack/Email。
+> **中文备注:** 同一组 9 个 helper,两条路径不同顺序。Path A 单事务交错跑、硬 gate;Path B 分组分多事务、事后标记。同代码不同语义,fact 表干净度可观测差异。
 
 ---
 
@@ -412,41 +443,43 @@ score = 0.5 × attr_match + 0.3 × token_jaccard + 0.2 × char_fuzz_ratio
 >
 > **中文备注:** 不用 ML;三信号加权;281 行参考用 ML 是过度工程;DQ 审核需要可解释。
 
-### 5b · `POST /load-data`(5 min · 重头戏)
+### 5b · `POST /pipeline` + `POST /load-data` 对比(5 min · 重头戏)
 
-**指代码:** [`api/services.py:122`](../Apple%20SDE/api/services.py#L122) 朗读 docstring。
+**指代码:** [`api/services.py:984`](../Apple%20SDE/api/services.py#L984) `run_pipeline` 朗读 docstring;[`api/services.py:780`](../Apple%20SDE/api/services.py#L780) `submit_load_job` 对比。
 
-**8 步流水线已在 §3b 画过图,这里强调:**
+**核心架构决策(在 §3 已画过图,这里强调"为什么是这两个端点"):**
 
-1. **整体在单一 PostgreSQL 事务内** —— 任何步骤失败整批回滚,不会有"半进半未进"
-2. **三阶段 DQ 设计的关键决策**:把"事实错误"(country↔currency 不一致等)作为 PRE_FACT gate **挡在 fact 之前**,把"软信号"(低置信、价格合理性)作为 SEMANTIC **flag-and-keep**。这样 `fact_price_offer` 不需要过滤视图就可信
-3. **CTI(Class Table Inheritance)** 表达支付多态 —— `fact_payment_full_price` / `fact_payment_instalment` 子表,父表无 sparse 列
-4. **SCD-2 历史** —— `fact_partner_price_history` 只在价格真变化时插行(预期 20–50× 行数压缩)
+1. **`/pipeline` 是 orchestrator**:把 9 个 helper 按 1→2→3→4→5(gate)→6→7→8→9 顺序串起来,**单 PostgreSQL 事务**——任何步骤失败整批回滚。**PRE_FACT 在步 5 之前 gate**,坏行不入 fact。
+2. **`/load-data` 是 Task B 字面要求的子模块**:只做 load 相关的步 1+3+5+7+9。题目要求"load data into the table"+ "standardise products using /harmonise-product, country codes, partner names, and timestamps" —— 所以 parse + harmonise + 写 fact 全在这。**不能 gate**(题目要求独立可调,不能等 `/compute-dq` 决定要不要写 fact)。
+3. **CTI(Class Table Inheritance)** 表达支付多态 —— `fact_payment_full_price` / `fact_payment_instalment` 子表,父表无 sparse 列。
+4. **Slowly Changing Dimension Type 2 历史** —— `fact_partner_price_history` 只在价格真变化时插行(预期 20–50× 行数压缩)。
 
 **台词:**
-> *"Single Postgres transaction wraps all 8 steps — atomicity gives us 'all or nothing'. The three-stage DQ split is the key design call: HIGH severity blocks at PRE_FACT before fact insert, MEDIUM/LOW flags-but-keeps after. Class Table Inheritance — payment-specific NOT NULL constraints become real instead of sparse columns. SCD-2 history compresses observation events into change events."*
+> *"`/pipeline` and `/load-data` aren't redundant — they live at different abstraction levels. `/pipeline` is the orchestrator: single Postgres transaction, full 9-step interleaved pipeline, PRE_FACT hard gate at step 5 keeps bad rows out of fact. `/load-data` is the Task-B literal sub-module: independently callable, does only the load-related steps (1, 3, 5 with no gate, 7, 9), DQ has to be triggered separately via `/compute-dq`. The trade-off is Path A's stronger guarantees vs Path B's flexibility — same 9 helpers, different orchestration."*
 
 ### 5c · `POST /compute-dq`(3 min)
 
-**指代码:** [`dq/rules.sql`](../Apple%20SDE/dq/rules.sql)(19 条 PL/pgSQL 函数)+ [`dq/rules_split.sql`](../Apple%20SDE/dq/rules_split.sql)(3 个 stage 编排器)。
+**指代码:** [`api/services.py:853`](../Apple%20SDE/api/services.py#L853) `compute_dq_service`;[`dq/rules.sql`](../Apple%20SDE/dq/rules.sql)(13 条 PL/pgSQL 函数)+ [`dq/rules_split.sql`](../Apple%20SDE/dq/rules_split.sql)(3 个 stage 编排器)。
+
+**Task B 字面要求:** 检查 DQ + 写 `dq_output` + 写 `dq_bad_records`。**已实现且仅做这件事**——request body 只接 `source_batch_id`,内部按 INGEST/PRE_FACT/SEMANTIC 顺序跑全部 13 条,然后聚合返回。
 
 **核心设计:** **DQ 规则全部跑在 PostgreSQL 内**,而不是 Python 逐行检查。
 - 每条规则是一个 `STABLE SQL` 函数,返回 `(row_ref, failed_field, error_message, raw_payload)`
 - 编排器扫规则目录,按 stage 跑对应规则
-- **一次 DB 调用代替 1900 万次 Python 检查**(1M 行 × 19 规则)
+- **一次 DB 调用代替 1300 万次 Python 检查**(1M 行 × 13 规则)
 
 **Live Demo(Swagger UI):** 展开 **`POST /compute-dq`** → **Try it out** → Request body 填:
 ```json
-{ "source_batch_id": "<上面 §2 复制的 BATCH_ID>" }
+{ "source_batch_id": "<§2c Path B 步骤 1 复制的 BATCH_ID>" }
 ```
 点 **Execute**,响应里能看到每条规则的 pass-rate + by-severity 汇总。
 
 **Live SQL(VSCode 补充):** 跑 [`demo_queries.sql`](demo_queries.sql) §4.1(规则总览)+ §4.2(DQ_HARM_002 拦截示例)展示底层落库情况。
 
 **台词:**
-> *"13 rules as PL/pgSQL functions. Postgres vectorises each scan — one DB call replaces 13 M Python checks at 1 M rows. The catalog table is metadata-driven: adding a new rule = one INSERT into `dq_rule_catalog`, no code change. The 3-stage split with severity-driven policy is the architectural innovation here."*
+> *"13 rules as PL/pgSQL functions. Postgres vectorises each scan — one DB call replaces 13 M Python checks at 1 M rows. The catalog table is metadata-driven: adding a new rule = one INSERT into `dq_rule_catalog`, no code change. The 3-stage split with severity-driven policy is the architectural innovation; the Task-B-literal contract — `source_batch_id` in, two tables written, summary returned — is what `/compute-dq` exposes."*
 >
-> **中文备注:** 19 条 SQL 函数;catalog driven 加规则不写代码;3-stage + severity policy 是设计亮点。
+> **中文备注:** 13 条 SQL 函数;catalog driven 加规则不写代码;3-stage + severity policy 是设计亮点。Request body 只接 source_batch_id,Task B 字面满足。
 
 ### 5d · `POST /detect-anomalies`(4 min)
 
@@ -581,7 +614,9 @@ Tier 1 (自动)        Tier 2 (业务)              Tier 3 (学习)
 | 为什么 FX rate 冻结进 fact 行? | `schema.sql` `fact_price_offer.fx_rate_date` 注释 |
 | Partner C 是 JSON 怎么办? | 在 `_step1_csv_to_staging` 加解析器;下游不变 |
 | Apple 出新品类怎么办? | `task_c_answers.md` C.1 第 4 行 — Catalog 团队加 Reference + replay |
-| 测试覆盖率? | `python3 -m pytest -q` → 39 passed(22 harmonise unit + 17 API integration) |
+| 测试覆盖率? | `python3 -m pytest -q` → 44 passed(22 harmonise unit + 22 API integration covering Path A pipeline + 4 Path B 子模块 + path-parity 测试) |
+| 为什么有 `/pipeline` 又有 4 个子模块? 重复了吗? | 不重复——共用 9 个 internal helper,零代码重复。`/pipeline` 是单事务硬 gate;子模块独立可调,gate 退化为事后标记。Trade-off。 |
+| Path A vs Path B 在数据上能看到差吗? | 能。同份 CSV 跑 Path A:`fact_price_offer` 干净;跑 Path B:fact 含坏行,需 `LEFT JOIN dq_bad_records WHERE bad_record_id IS NULL` 过滤 |
 | 怎么衡量 anomaly detection 准确率? | 历史标记数据做 precision/recall;`dim_anomaly_threshold` 支持 A/B 对比 |
 
 ---
@@ -593,11 +628,12 @@ dropdb maya_assignment 2>/dev/null && createdb maya_assignment
 cd "Apple SDE"
 psql -d maya_assignment -f schema.sql -f dq/rules.sql -f dq/rules_split.sql
 python3 seed_bootstrap.py
-curl -X POST http://localhost:8000/load-data -F "file=@Partner A.csv" -F "partner_code=PARTNER_A"
-curl -X POST http://localhost:8000/load-data -F "file=@Partner B.csv" -F "partner_code=PARTNER_B"
+# 用 Path A `/pipeline` 一键灌两个 partner(干净 fact,gate 生效)
+curl -X POST http://localhost:8000/pipeline -F "file=@Partner A.csv" -F "partner_code=PARTNER_A"
+curl -X POST http://localhost:8000/pipeline -F "file=@Partner B.csv" -F "partner_code=PARTNER_B"
 ```
 
-**预期行数:** stg ~4208 / fact ~4174 / history 119 / bad_records ~188 / dq_output 26。
+**预期行数:** stg ~4208 / fact ~4174 / history 119 / bad_records ~188 / dq_output 26(Path A 跑完后)。
 
 ## 附录 B · 翻车应急
 

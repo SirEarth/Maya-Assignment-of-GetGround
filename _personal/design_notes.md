@@ -253,97 +253,73 @@ When a partner omits the "GB" suffix, check standalone digit tokens against Appl
 **存储容量兜底识别：**
 当 Partner 省略 "GB" 后缀时，检查独立数字 token 是否落在 Apple SKU 存储容量集合 `{64, 128, 256, 512, 1024, 2048}` 中。这个集合故意窄 —— iPad 屏幕尺寸（11/13）和 iPhone 型号年份（15/16/17）**不在**集合里，避免误识别。
 
-### B.2 POST /load-data — Ingestion Pipeline / 数据加载流水线
+### B.2 POST /pipeline + POST /load-data — Two-Path Ingestion Architecture / 双路径数据加载架构
 
 #### EN
 
-**Key principle:** `fact_price_offer` is an *event* table — only stores
-**meaningful price events** (new product, or price change vs current
-`fact_partner_price_history` row). Crawl observations that show the same
-price as before are NOT inserted there; only the per-batch counter
-`dws_partner_dq_per_batch.rows_unchanged` is incremented.
+**Architectural decision.** The API exposes **two call paths sharing the same 9 internal step helpers** in `api/services.py`:
 
-This makes `fact_price_offer` semantically clean: every row represents a
-business event, not a redundant scrape result.
+- **Path A — `POST /pipeline`** (orchestrator) — runs all 9 steps in a single PostgreSQL transaction with PRE_FACT hard gate enabled
+- **Path B — 4 Task-B sub-modules** (`/load-data` + `/compute-dq` + `/detect-anomalies` + `/harmonise-product`) — each independently callable; covers the same 9 steps in grouped transactions; PRE_FACT degrades to post-hoc flagging
 
-1. Parse record/file → INSERT into `stg_price_offer` (raw payload preserved
-   for audit regardless of validity)
-2. Run **INGEST-stage DQ** (8 rules: nulls, format, range, conditional) on
-   raw stg → populate `dq_output` + `dq_bad_records` for failures. Mark
-   passing rows with `dq_status='INGEST_PASSED'`.
-3. Call `/harmonise-product` (in-process) for INGEST-passing rows → write
-   `product_model_id`, `harmonise_score`, `harmonise_confidence` back to stg.
-4. Run **PRE_FACT-stage DQ** (3 HIGH-severity rules: country↔currency match,
-   partner↔country match, harmonise unmatched) on the enriched stg. Failing
-   rows are recorded in `dq_bad_records` and **do NOT enter fact tables**.
-   Mark survivors with `dq_status='PRE_FACT_PASSED'`. This is the gate that
-   guarantees `fact_price_offer` only contains factually consistent data —
-   downstream analytics queries trust the table without needing filter-views.
-5. Build `fact_price_offer` from PRE_FACT-passing stg rows:
-   - normalize country → ISO code (via `dim_country`)
-   - normalize timestamp → UTC + market-local via `dim_country.primary_tz_id`
-   - look up FX rate from `dim_currency_rate_snapshot` using `crawl_date` → freeze it
-   - compute `effective_total_local` (instalment → monthly × months) and `effective_total_usd`
-   - INSERT into `fact_price_offer` + child payment table (`fact_payment_full_price`
-     or `fact_payment_instalment` per CTI design)
-6. Run **SEMANTIC-stage DQ** (2 rules: low-confidence harmonise + category
-   sanity bounds) on the freshly-written fact rows. **Failing rows STAY in
-   fact** — these are *soft signals* where business judgment is required
-   (e.g., a price outside the category sanity band might be a real
-   promotion, not an error). Records flagged in `dq_bad_records` for
-   review via `/bad-records`. Cross-row pricing patterns (variance,
-   temporal jumps, cross-partner divergence) live in `/detect-anomalies`,
-   not in DQ.
-7. SCD-2 history reconciliation (single CTE: latest → existing → changed
-   → closed → insert) updates `fact_partner_price_history`.
-8. Event-driven INSERT into `dws_partner_dq_per_batch` (loaded_records,
-   bad_records_count, harmonise stats) → optional `pg_notify` alert.
+Both paths invoke the same Python helpers — zero code duplication.
 
-**Severity policy.** HIGH severity = blocks from fact (PRE_FACT stage).
-MEDIUM/LOW severity = stays in fact, flagged for triage (SEMANTIC stage).
-Adding a new gate rule = one row in `dq_rule_catalog` with
-`target_stage='PRE_FACT'`, no code change.
+**Why two paths.** Task B requires 4 independently callable endpoints (Path B). But hard PRE_FACT gating is **only possible inside single-process sequential execution** because `/load-data` cannot wait for `/compute-dq` to decide whether to write fact. The orchestrator endpoint recovers the gating semantic without violating Task B's modular requirement.
+
+**Key principle for fact_price_offer.** It's an *event* table — only stores **meaningful price events** (new product, or price change vs current `fact_partner_price_history` row). Crawl observations that show the same price as before are NOT inserted there; only the per-batch counter `dws_partner_dq_per_batch.rows_unchanged` is incremented. Every row represents a business event, not a redundant scrape result.
+
+**The 9 steps (same helpers, different orchestration order):**
+
+1. **`parse_csv_to_stg`** — parse record/file → INSERT into `stg_price_offer` (raw payload preserved for audit regardless of validity)
+2. **`run_ingest_dq`** — INGEST-stage DQ (8 rules: nulls, format, range, conditional) on raw stg → populate `dq_output` + `dq_bad_records` for failures. Mark passing rows with `dq_status='INGEST_PASSED'`.
+3. **`harmonise_in_stg`** — call the harmoniser (in-process) for each row → write `product_model_id`, `harmonise_score`, `harmonise_confidence` back to stg.
+4. **`run_prefact_dq`** — PRE_FACT-stage DQ (3 HIGH-severity rules: country↔currency match, partner↔country match, harmonise unmatched) on the enriched stg. Failing rows are recorded in `dq_bad_records`. Mark survivors with `dq_status='PRE_FACT_PASSED'`.
+5. **`write_stg_to_fact(gate=…)`** — **the divergence point**:
+   - **Path A (`gate=True`)**: only PRE_FACT_PASSED rows enter `fact_price_offer`. Bad rows blocked at the boundary. `fact_price_offer` is trustworthy by construction; downstream analytics trust the table without needing filter-views.
+   - **Path B (`gate=False`)**: all parseable rows enter fact. Bad rows are flagged in `dq_bad_records` post-hoc by step 2/4 (which run later via `/compute-dq`). Analytics queries must `LEFT JOIN dq_bad_records WHERE bad_record_id IS NULL` to filter.
+   - Both paths build the row from: country → ISO code (via `dim_country`); timestamp → UTC + market-local; FX rate frozen from `dim_currency_rate_snapshot` using `crawl_date`; `effective_total_local` + `effective_total_usd` computed; INSERT into `fact_price_offer` + child payment table (`fact_payment_full_price` or `fact_payment_instalment` per CTI design).
+6. **`run_semantic_dq`** — SEMANTIC-stage DQ (2 rules: low-confidence harmonise + category sanity bounds) on the freshly-written fact rows. **Failing rows STAY in fact** — these are *soft signals* where business judgment is required. Records flagged in `dq_bad_records` for review via `/bad-records`. Cross-row pricing patterns (variance, temporal jumps, cross-partner divergence) live in `/detect-anomalies`, not in DQ.
+7. **`update_scd2`** — SCD-2 history reconciliation (single CTE: latest → existing → changed → closed → insert) updates `fact_partner_price_history`.
+8. **`detect_anomalies_for_batch`** — STATISTICAL signal vs 30-day baseline from SCD-2 history; build visualization payload (series + band + cross-partner). Path A runs this inline; Path B runs it via `/detect-anomalies`.
+9. **`write_batch_summary`** — UPSERT into `dws_partner_dq_per_batch` (loaded_records, bad_records_count, harmonise stats). Idempotent; on Path B each endpoint refreshes the row at its tail so the summary fills incrementally.
+
+**Path A invocation order:** 1→2→3→4→5(gate=True)→6→7→8→9 inside one transaction.
+**Path B invocation order:** /load-data does {1, 3, 5(gate=False), 7}; /compute-dq does {2, 4, 6}; /detect-anomalies does {8}; each endpoint runs step 9 at its tail.
+
+**Severity policy.** HIGH severity = blocks from fact on Path A (PRE_FACT stage); flagged on Path B. MEDIUM/LOW severity = stays in fact, flagged for triage (SEMANTIC stage). Adding a new gate rule = one row in `dq_rule_catalog` with `target_stage='PRE_FACT'`, no code change.
 
 #### 中文
 
-**核心原则：** `fact_price_offer` 是**事件表** —— 只存储**有意义的价格事件**
-（新产品、或相对 `fact_partner_price_history` 当前行有价格变化）。
-和上次价格相同的爬取观测**不**写入 `fact_price_offer`；只把每批的
-`dws_partner_dq_per_batch.rows_unchanged` 计数器加 1。
+**架构决策。** API 暴露**两条共用同一组 9 个内部 step helper 的调用路径**(都在 `api/services.py`):
 
-这样 `fact_price_offer` 在语义上很干净：每一行都代表一个业务事件，
-不是冗余的爬虫结果。
+- **Path A — `POST /pipeline`**(编排端点)—— 单 PostgreSQL 事务里跑完 9 步,带 PRE_FACT 硬 gate
+- **Path B — Task B 4 个子模块**(`/load-data` + `/compute-dq` + `/detect-anomalies` + `/harmonise-product`)—— 各自独立可调,分组多事务覆盖同样 9 步;PRE_FACT 退化为事后标记
 
-1. 解析记录/文件 → INSERT 到 `stg_price_offer`（无论是否合法都保留原 payload 用于审计）
-2. 跑 **INGEST 阶段 DQ**（8 条规则:空值、格式、范围、条件依赖)于原始 stg
-   → 失败行写 `dq_output` + `dq_bad_records`;通过的行标记 `dq_status='INGEST_PASSED'`。
-3. 对 INGEST 通过的行调用 `/harmonise-product`（进程内）→ 把
-   `product_model_id`、`harmonise_score`、`harmonise_confidence` 写回 stg。
-4. 跑 **PRE_FACT 阶段 DQ**（3 条 HIGH 严重度规则：country↔currency、
-   partner↔country、harmonise 未匹配）于 enriched stg。**失败行不进 fact 表**，
-   只在 `dq_bad_records` 留痕；通过的行标记 `dq_status='PRE_FACT_PASSED'`。
-   这一步是保证 `fact_price_offer` 数据可信的 gate —— 下游分析查询不再需要过滤视图剔除未解决的 HIGH 错误。
-5. 从 PRE_FACT 通过的 stg 行构建 `fact_price_offer`：
-   - 国家代码标准化 → ISO（查 `dim_country`）
-   - 时间戳标准化 → UTC + 通过 `dim_country.primary_tz_id` 派生本地时间
-   - 用 `crawl_date` 查 `dim_currency_rate_snapshot` → **冷冻**汇率
-   - 计算 `effective_total_local`（分期 → monthly × months）和 `effective_total_usd`
-   - INSERT `fact_price_offer` + 写入 payment 子表（`fact_payment_full_price` /
-     `fact_payment_instalment`，CTI 设计）
-6. 跑 **SEMANTIC 阶段 DQ**（2 条规则:低置信 harmonise + 品类合理范围)
-   于已写入的 fact 行。**失败行保留在 fact 中** ——
-   这些是*软信号*,需要业务判断(例如类别外的价格可能是真促销而非错误)。
-   只在 `dq_bad_records` 标记,由业务通过 `/bad-records` 审核。
-   跨行的价格模式(价差、日间突变、跨 partner 分歧)由 `/detect-anomalies` 处理,不在 DQ 范围内。
-7. SCD-2 历史协调（单条 CTE：latest → existing → changed → closed → insert）
-   更新 `fact_partner_price_history`。
-8. Event-driven INSERT 到 `dws_partner_dq_per_batch`（loaded_records、
-   bad_records_count、harmonise 统计）→ 可选 `pg_notify` 告警。
+两条路径调用**同一组** Python helper —— 零代码重复。
 
-**严重度策略：** HIGH 严重度 = 阻止进 fact（PRE_FACT 阶段）。
-MEDIUM/LOW 严重度 = 进 fact 但打标签等待审核（SEMANTIC 阶段）。
-要新加一条 gate 规则 = `dq_rule_catalog` 加一行 `target_stage='PRE_FACT'`，
-零代码修改。
+**为什么两条路径。** Task B 字面要求 4 个独立可调端点(Path B)。但**硬 PRE_FACT gate 只能在单进程顺序执行里实现**——`/load-data` 不能等 `/compute-dq` 决定是否写 fact。Orchestrator 端点恢复了 gate 语义,同时不违反 Task B 的模块化要求。
+
+**fact_price_offer 的核心原则。** 是**事件表** —— 只存储**有意义的价格事件**(新产品、或相对 `fact_partner_price_history` 当前行有价格变化)。和上次价格相同的爬取观测**不**写入 `fact_price_offer`;只把每批的 `dws_partner_dq_per_batch.rows_unchanged` 计数器加 1。每一行都代表一个业务事件,不是冗余的爬虫结果。
+
+**9 步(同一组 helper,不同编排顺序):**
+
+1. **`parse_csv_to_stg`** —— 解析记录/文件 → INSERT 到 `stg_price_offer`(无论是否合法都保留原 payload)
+2. **`run_ingest_dq`** —— INGEST 阶段 DQ(8 条规则)于原始 stg → 失败行写 `dq_output` + `dq_bad_records`;通过的标 `dq_status='INGEST_PASSED'`
+3. **`harmonise_in_stg`** —— 进程内调 harmoniser → 把 `product_model_id`/`harmonise_score`/`harmonise_confidence` 写回 stg
+4. **`run_prefact_dq`** —— PRE_FACT 阶段 DQ(3 条 HIGH 严重度规则)于 enriched stg → 失败行写 `dq_bad_records`;通过的标 `dq_status='PRE_FACT_PASSED'`
+5. **`write_stg_to_fact(gate=…)`** —— **关键分歧点**:
+   - **Path A (`gate=True`)**:只有 PRE_FACT_PASSED 行进 `fact_price_offer`,坏行被挡。fact 表 by construction 可信,下游分析不需要过滤视图。
+   - **Path B (`gate=False`)**:所有可解析行都进 fact。坏行后续被 `/compute-dq` 在 `dq_bad_records` 事后标记。分析查询须 `LEFT JOIN dq_bad_records WHERE bad_record_id IS NULL` 过滤。
+   - 两路径都做:国家 → ISO;时间戳 → UTC + 本地;FX 冷冻;`effective_total_local` + `effective_total_usd` 计算;INSERT `fact_price_offer` + payment 子表(CTI 设计)
+6. **`run_semantic_dq`** —— SEMANTIC 阶段 DQ(2 条软信号规则)于已写入 fact 行。**失败行保留在 fact 中**(软信号需业务判断),只标记。
+7. **`update_scd2`** —— SCD-2 历史协调(单 CTE)更新 `fact_partner_price_history`
+8. **`detect_anomalies_for_batch`** —— STATISTICAL signal vs 30 天基线;构建 visualization payload。Path A 内联跑,Path B 通过 `/detect-anomalies` 跑。
+9. **`write_batch_summary`** —— UPSERT 到 `dws_partner_dq_per_batch`,幂等。Path B 每个端点尾部都跑一次,summary 增量填充。
+
+**Path A 调用顺序:** 1→2→3→4→5(gate=True)→6→7→8→9,单事务。
+**Path B 调用顺序:** /load-data 跑 {1, 3, 5(gate=False), 7};/compute-dq 跑 {2, 4, 6};/detect-anomalies 跑 {8};每个端点尾部跑步 9。
+
+**严重度策略。** HIGH 严重度 = 在 Path A 阻止进 fact(PRE_FACT 阶段);Path B 下事后标记。MEDIUM/LOW 严重度 = 进 fact 但打标签等待审核(SEMANTIC 阶段)。新加 gate 规则 = `dq_rule_catalog` 加一行 `target_stage='PRE_FACT'`,零代码修改。
 
 > 业务侧的疑问"我们今天到底有没有爬 Partner X？" → 查
 > `dws_partner_dq_per_batch` 即可（rows_unchanged + loaded_records 之和 =

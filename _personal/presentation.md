@@ -70,20 +70,27 @@ Tech stack: PostgreSQL 14+ • Python 3.9+ • FastAPI • Pydantic 2 • asyncp
 - **Slowly Changing Dimension Type 2** (`fact_partner_price_history`) for compressed price history
 - **3 DQ tables** (`dq_rule_catalog` / `dq_output` / `dq_bad_records`) with workflow state
 
-**Task B — 4 endpoints (✅ all implemented, real PostgreSQL backend):**
-- `GET /harmonise-product` — Top-K with score breakdown
-- `POST /load-data` — 8-step ingest pipeline in single transaction
-- `POST /compute-dq` — 13 PL/pgSQL rules across 3 stages
-- `POST /detect-anomalies` — multi-signal + structured visualization payload
+**Task B — 4 endpoints + orchestrator (✅ all implemented, real PostgreSQL backend):**
+
+The API is **one independent service** with two call paths:
+
+- **Path A — `POST /pipeline`** (orchestrator) — runs all 9 steps in a single PostgreSQL transaction; PRE_FACT hard gate keeps bad rows out of `fact_price_offer`.
+- **Path B — 4 Task-B sub-modules** (independently callable):
+  - `POST /load-data` — parse + harmonise + write fact (no gate) + Slowly Changing Dimension Type 2
+  - `POST /compute-dq` — 13 PL/pgSQL rules across 3 stages → `dq_output` + `dq_bad_records`
+  - `POST /detect-anomalies` — STATISTICAL signal + structured visualization payload
+  - `GET /harmonise-product` — Top-K with score breakdown
+
+Both paths invoke the **same 9 internal step helpers** in `api/services.py` — zero code duplication.
 
 **Task C — 3 short write-ups (✅ in `submission/task_c_answers.md`):**
 - C-1 data model adaptation when new partners onboard
 - C-2 DQ + business correction loop
-- C-3 scaling `/load-data` to 1 M records
+- C-3 scaling to 1 M records
 
-**Quality bar:** **39 / 39 automated tests passing** (22 harmonise unit + 17 API integration).
+**Quality bar:** **44 / 44 automated tests passing** (22 harmonise unit + 22 API integration covering Path A pipeline + 4 Path B sub-modules + path-parity tests).
 
-**Architectural innovation beyond the spec:** **3-stage DQ with severity-driven policy** (INGEST → PRE_FACT gate → SEMANTIC) — makes `fact_price_offer` trustworthy by construction.
+**Architectural innovation beyond the spec:** **3-stage DQ with severity-driven policy** (INGEST → PRE_FACT gate → SEMANTIC) — combined with the Path A orchestrator, makes `fact_price_offer` trustworthy by construction.
 
 ---
 
@@ -97,10 +104,10 @@ Tech stack: PostgreSQL 14+ • Python 3.9+ • FastAPI • Pydantic 2 • asyncp
 
 | Step | Where | What |
 |---|---|---|
-| 1 | Browser (Swagger UI) | Scroll through all 8 endpoints; Pydantic auto-generated, nothing handwritten |
-| 2 | Swagger UI → `POST /load-data` | "Try it out" → upload `Partner A.csv` + `partner_code=PARTNER_A` → Execute. Copy `source_batch_id` from the response panel. |
-| 3 | Swagger UI → `POST /load-data` again | Upload `Partner B.csv` → tell the **NZ story** (154 rows; resolver fix; replay loop) |
-| 4 | Browser → `results_showcase.html` | Open the static visual dashboard; walk through the 7 cards: headline numbers → pipeline funnel (with the 9 Apple Watch SKUs blocked story) → harmonise confidence pie → DQ pass-rate bars → anomaly time-series with band → sample harmonise breakdowns → sample bad records → NZ 154-rows iteration story |
+| 1 | Browser (Swagger UI) | Scroll through all 9 endpoints; explain dual-path (Path A `/pipeline` + Path B 4 Task-B sub-modules). Pydantic auto-generated. |
+| 2 | Swagger UI → **`POST /pipeline`** | Path A demo: "Try it out" → upload `Partner A.csv` + `partner_code=PARTNER_A` → Execute. Single response includes `dq_summary` + `anomalies_total`. Copy `source_batch_id`. |
+| 3 | Swagger UI → **`POST /load-data`** then **`/compute-dq`** then **`/detect-anomalies`** | Path B demo: same 9 steps in three calls. Tell **NZ story** during `/load-data` upload of `Partner B.csv` (154 rows; resolver fix; replay loop). Use the `/compute-dq` response to show post-hoc flagging — bad rows ARE in fact, just labelled. |
+| 4 | Browser → `results_showcase.html` | Open the static visual dashboard; walk through the cards: headline numbers → pipeline funnel (with the 9 Apple Watch SKUs blocked story) → harmonise confidence pie → DQ pass-rate bars → anomaly time-series with band → sample harmonise breakdowns → sample bad records → NZ 154-rows iteration story |
 | 5 | (Optional) VSCode Database Panel | One quick `demo_queries.sql §0` sanity check to prove the dashboard reflects live DB, not a pre-rendered mock. Other SQL sections kept as drill-down for Q&A follow-ups. |
 
 **Expected baseline numbers after both uploads:**
@@ -122,7 +129,7 @@ Tech stack: PostgreSQL 14+ • Python 3.9+ • FastAPI • Pydantic 2 • asyncp
 
 ---
 
-## Slide 5 — Architecture (3-Layer)
+## Slide 5 — Architecture (3-Layer · Dual Call Path)
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
@@ -133,18 +140,27 @@ Tech stack: PostgreSQL 14+ • Python 3.9+ • FastAPI • Pydantic 2 • asyncp
                                ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │  API Layer · FastAPI + Pydantic 2 (api/main.py)                    │
-│   /load-data    /compute-dq    /detect-anomalies                   │
-│   /harmonise-*  /bad-records   /load-data/{id}                     │
+│                                                                    │
+│   ▸ Path A (orchestrator):  POST /pipeline                         │
+│   ▸ Path B (Task-B sub-modules):                                   │
+│        POST /load-data    POST /compute-dq                         │
+│        POST /detect-anomalies   GET /harmonise-product             │
+│   ▸ Support: /bad-records, /load-data/{id}, /health                │
 └──────────────────────────────┬─────────────────────────────────────┘
-                               │
+                               │ both paths invoke the SAME helpers ↓
                                ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │  Service Layer · Async Python (api/services.py)                    │
-│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐    │
-│  │  Harmoniser  │  │ DQ runtime   │  │ Anomaly detector       │    │
-│  │ (in-memory   │  │ (calls SQL   │  │ (statistical baseline  │    │
-│  │  Top-K)      │  │  functions)  │  │  + visualization)      │    │
-│  └──────────────┘  └──────────────┘  └────────────────────────┘    │
+│                                                                    │
+│  9 step helpers (shared by Path A and Path B):                     │
+│   1. parse_csv_to_stg            6. run_semantic_dq                │
+│   2. run_ingest_dq               7. update_scd2                    │
+│   3. harmonise_in_stg            8. detect_anomalies_for_batch     │
+│   4. run_prefact_dq              9. write_batch_summary            │
+│   5. write_stg_to_fact(gate=…)                                     │
+│                                                                    │
+│  Service entry points: run_pipeline · submit_load_job ·            │
+│                         compute_dq_service · detect_anomalies_…    │
 └──────────────────────────────┬─────────────────────────────────────┘
                                │ asyncpg pool
                                ▼
@@ -153,9 +169,10 @@ Tech stack: PostgreSQL 14+ • Python 3.9+ • FastAPI • Pydantic 2 • asyncp
 │                                                                    │
 │  ▸ Dimensions (14): dim_country / dim_partner / dim_product_*      │
 │                     dim_currency_rate_snapshot · dim_anomaly_*     │
-│  ▸ Facts (5):       fact_price_offer (CTI parent)                  │
+│  ▸ Facts (5):       fact_price_offer (Class Table Inheritance)     │
 │                     fact_payment_full_price · fact_payment_*       │
-│                     fact_partner_price_history (SCD-2)             │
+│                     fact_partner_price_history (Slowly Changing    │
+│                                                  Dimension Type 2) │
 │                     fact_anomaly                                   │
 │  ▸ DQ (3):          dq_rule_catalog (13 rules) · dq_output         │
 │                     dq_bad_records (workflow + raw_payload JSONB)  │
@@ -164,18 +181,16 @@ Tech stack: PostgreSQL 14+ • Python 3.9+ • FastAPI • Pydantic 2 • asyncp
 ```
 
 **Why this split:**
-- **API layer** is thin — Pydantic auto-validates inputs and auto-generates OpenAPI; no separate spec to maintain.
-- **Service layer** holds pure-Python algorithms (Harmoniser singleton + Anomaly detector) and orchestrates SQL calls.
+- **API layer** offers two paths over the same logic. Path A (`/pipeline`) is the one-click orchestrator with strict gating. Path B (4 Task-B sub-modules) provides independently callable endpoints — what the assignment literally specifies. Pydantic auto-validates and auto-generates OpenAPI.
+- **Service layer** holds the **9 shared step helpers** plus the entry points that orchestrate them. Both paths call the same helper functions — zero code duplication; the only difference is orchestration order and the `gate` parameter to `write_stg_to_fact`.
 - **Data layer** is PostgreSQL with a 29-table star schema; asyncpg pool gives concurrent queries without thread overhead.
 
 ---
 
-## Slide 6 — Business Pipeline (Sync Ingest + Async Anomaly Detection)
+## Slide 6 — Business Pipeline (9 Steps · Two Call Paths)
 
 ```
-   ═══════ /load-data sync pipeline (single PostgreSQL transaction) ═══════
-
-   Partner CSV upload
+   Partner CSV upload + partner_code
            │
            ▼
    ① Parse → stg_price_offer (raw_payload JSONB preserved)
@@ -187,48 +202,52 @@ Tech stack: PostgreSQL 14+ • Python 3.9+ • FastAPI • Pydantic 2 • asyncp
    ③ Harmonise — Top-K 3-signal match, write product_model_id back to stg
            │
            ▼
-   ④ PRE_FACT DQ (3 rules) — ⚠️ HIGH-severity GATE
-           │  country↔currency / partner↔country / harmonise unmatched
-           │  failing rows → dq_bad_records, NEVER enter fact
-           │  passing rows → dq_status='PRE_FACT_PASSED'
+   ④ PRE_FACT DQ (3 rules) — country↔currency / partner↔country /
+           │  harmonise unmatched. Failing rows → dq_bad_records.
+           │  Passing rows → dq_status='PRE_FACT_PASSED'
            ▼
-   ⑤ Build facts — fact_price_offer (parent) + fact_payment_* (CTI children)
+   ⑤ write_stg_to_fact(gate=…)   ⚠️ KEY DIVERGENCE POINT:
            │
+           │  Path A  (gate=True)   only PRE_FACT_PASSED rows enter
+           │     → fact clean        fact_price_offer (Class Table
+           │                         Inheritance: full_price /
+           │                         instalment 1:1 children)
+           │
+           │  Path B  (gate=False)  all parseable rows enter fact
+           │     → fact has flagged  later analytics filter via
+           │       rows; review via   LEFT JOIN dq_bad_records
+           │       /bad-records       WHERE bad_record_id IS NULL
            ▼
    ⑥ SEMANTIC DQ (2 rules) — single-row soft signals (low-confidence
-           │  harmonise, category sanity bounds). flag-and-keep policy.
+           │  harmonise, category sanity bounds). Flag-and-keep policy.
            ▼
-   ⑦ SCD-2 reconciliation — single CTE: latest → existing → changed
-           │                              → closed → insert
+   ⑦ Slowly Changing Dimension Type 2 — single CTE:
+           │   latest → existing → changed → closed → insert
            │  → fact_partner_price_history
            ▼
-   ⑧ Batch summary → dws_partner_dq_per_batch
-           │
-           │  transaction commit
+   ⑧ detect_anomalies_for_batch — STATISTICAL signal vs 30-day baseline,
+           │  visualization payload (series + band + cross-partner JSON)
            ▼
-   ═════════ Async downstream (on-demand / scheduled trigger) ═════════════
+   ⑨ write_batch_summary → dws_partner_dq_per_batch (UPSERT, idempotent)
 
-           POST /detect-anomalies (multi-signal detector)
-                   │
-                   │  reads:
-                   │   • fact_partner_price_history (history baseline)
-                   │   • dws_product_price_baseline_1d (rolling stats)
-                   │   • dim_anomaly_threshold (thresholds)
-                   │   • dim_market_event (suppression windows)
-                   ▼
-           4-signal scoring (each independent severity):
-              STATISTICAL · TEMPORAL · CROSS_PARTNER · SKU_VARIANCE
-                   │
-                   │ each triggered signal = one fact_anomaly row
-                   │ visualization payload (series + band + cross-partner)
-                   ▼
-           fact_anomaly  ───►  dim_alert_policy routing
-                                 HIGH  → Slack / Teams (immediate)
-                                 MED   → Email digest (daily)
-                                 LOW   → UI only
+   ════════════ Two paths, same 9 helpers ══════════════════════════════
+
+   Path A — POST /pipeline           single transaction; interleaved
+                                      1→2→3→4→5(gate)→6→7→8→9
+                                      `fact_price_offer` is clean by gate
+
+   Path B — sub-module sequence      multi-transaction; grouped
+     POST /load-data                 helpers 1, 3, 5(no gate), 7
+     POST /compute-dq                helpers 2, 4, 6
+     POST /detect-anomalies          helper 8
+     (each endpoint UPSERTs step 9 → summary fills incrementally)
+                                      `fact` contains flagged rows
+
+   Future extension: anomaly alerting (out of demo scope) —
+   fact_anomaly → dim_alert_policy routing → Slack HIGH / Email MED / UI LOW
 ```
 
-**Key design call:** the 8 sync steps run inside **one PostgreSQL transaction** — any failure rolls back the whole batch. Anomaly detection is **decoupled** as a separate API call so it can be re-run with tuned thresholds without re-ingesting.
+**Key design call:** the 9 steps run as helper functions in `api/services.py`. **Path A** invokes them in interleaved order inside one PostgreSQL transaction — any failure rolls back the whole batch; the PRE_FACT gate at step 5 keeps bad rows out of fact. **Path B** invokes them in grouped order across three transactions — Task B's literal contract of 4 independently callable endpoints; the gate degrades to post-hoc flagging in `dq_bad_records`. Both paths cover all 9 logical steps — same code, different orchestration.
 
 **Three DQ stages, three policies:**
 
@@ -357,20 +376,21 @@ POST /detect-anomalies
 
 ## Slide 10 — API Surface
 
-| Endpoint | Method | Purpose | Implementation |
-|----------|--------|---------|----------------|
-| `/load-data` | POST | Submit CSV, run 8-step pipeline | `api/services.py:122` |
-| `/load-data/{job_id}` | GET | Poll progress | `api/services.py:get_job_status` |
-| `/harmonise-product` | GET | Top-K canonical match + score | `harmonise/` (6 modules) |
-| `/compute-dq` | POST | Run DQ rules on a batch | `api/services.py:compute_dq` + `dq/rules.sql` |
-| `/detect-anomalies` | POST | Multi-signal anomaly detection | `api/services.py:detect_anomalies` |
-| `/bad-records` | GET | List flagged records | `api/services.py:list_bad_records` |
-| `/bad-records/{id}/resolve` | POST | Resolve + optionally replay | `api/services.py:resolve_bad_record` |
-| `/health` | GET | Liveness probe | `api/main.py:health` |
+| Endpoint | Method | Path | Purpose | Implementation |
+|----------|--------|---|---------|----------------|
+| `/pipeline` | POST | **A — orchestrator** | One-click 9-step pipeline; PRE_FACT hard gate | `api/services.py:run_pipeline` |
+| `/load-data` | POST | B — sub-module #1 | Parse + harmonise + write fact (no gate) + Slowly Changing Dimension Type 2 | `api/services.py:submit_load_job` |
+| `/load-data/{job_id}` | GET | B — support | Poll progress | `api/services.py:get_job_status` |
+| `/compute-dq` | POST | B — sub-module #2 | Run all 13 DQ rules → 2 tables | `api/services.py:compute_dq_service` + `dq/rules.sql` |
+| `/detect-anomalies` | POST | B — sub-module #3 | STATISTICAL anomaly detection + visualization payload | `api/services.py:detect_anomalies_service` |
+| `/harmonise-product` | GET | B — sub-module #4 | Top-K canonical match + score | `harmonise/` (6 modules) |
+| `/bad-records` | GET | Support | List flagged records | `api/services.py:list_bad_records` |
+| `/bad-records/{id}/resolve` | POST | Support | Resolve + optionally replay | `api/services.py:resolve_bad_record` |
+| `/health` | GET | Support | Liveness probe | `api/main.py:health` |
 
 **Built with FastAPI + Pydantic 2:** typed contracts everywhere; auto-generated OpenAPI 3.x at `/docs` (Swagger UI) and `/redoc`.
 
-**Tested:** 39 automated tests (22 harmonise unit + 17 API integration via FastAPI TestClient with active lifespan).
+**Tested:** 44 automated tests (22 harmonise unit + 22 API integration covering Path A pipeline + 4 Path B sub-modules + path-parity tests).
 
 ---
 
@@ -399,21 +419,35 @@ score = 0.5 × attribute_match    (structured: category, storage, chip, model)
 
 ---
 
-## Slide 12 — `POST /load-data`
+## Slide 12 — `POST /pipeline` + `POST /load-data` (Path A vs Path B)
 
-**The 8-step pipeline (see Slide 6 diagram).** This is the centrepiece — five design calls worth highlighting:
+**Two endpoints, same 9 helpers, different orchestration** (see Slide 6 diagram).
 
-**1. Single PostgreSQL transaction.** All 8 steps wrap inside `async with conn.transaction():`. Any failure rolls back the whole batch — no half-loaded state, idempotent re-tries.
+**`POST /pipeline` — orchestrator**, single PostgreSQL transaction
+- Runs all 9 helpers in interleaved order: 1→2→3→4→5(gate=True)→6→7→8→9
+- **PRE_FACT hard gate** at step 5: bad rows do NOT enter `fact_price_offer`
+- Returns aggregated `PipelineResponse` (rows_loaded + dq_summary + anomalies_total)
+- Use when: production one-click ingest with strong cleanliness guarantees
 
-**2. Three-stage DQ with severity policy.** INGEST blocks at stg; **PRE_FACT blocks at the gate before fact insert** (the architectural innovation); SEMANTIC flags-and-keeps after fact write.
+**`POST /load-data` — Task-B literal sub-module**, independently callable
+- Covers helpers 1 (parse), 3 (harmonise), 5 with gate=False, 7 (Slowly Changing Dimension Type 2)
+- **No gate**: all parseable rows enter fact; `/compute-dq` flags bad rows post-hoc
+- Returns HTTP 202 + `job_id` — matches the C-3 async contract
+- Use when: debugging, ad-hoc loads, scenarios where DQ runs separately
+
+**Five design calls hold for both paths:**
+
+**1. Same code path.** Both endpoints invoke the same 9 helpers — only orchestration order and the `gate` flag differ. Zero duplication.
+
+**2. Three-stage DQ with severity policy.** INGEST blocks at stg; PRE_FACT either blocks at fact (Path A) or flags post-hoc (Path B); SEMANTIC always flags-and-keeps after fact write.
 
 **3. Class Table Inheritance for payment.** `fact_price_offer` has a `payment_type_enum` discriminator; `fact_payment_full_price` and `fact_payment_instalment` are 1:1 child tables with their own NOT NULL + CHECK constraints (impossible in a sparse single-table design).
 
-**4. Currency frozen on fact row.** Step ⑤ JOINs `dim_currency_rate_snapshot` once at load time and stores `effective_total_local`, `effective_total_usd`, `fx_rate_to_usd`, `fx_rate_date` on the fact. Future FX corrections don't retroactively change historical USD values.
+**4. Currency frozen on fact row.** Helper 5 JOINs `dim_currency_rate_snapshot` once at load time and stores `effective_total_local`, `effective_total_usd`, `fx_rate_to_usd`, `fx_rate_date` on the fact. Future FX corrections don't retroactively change historical USD values.
 
-**5. SCD-2 reconciliation in one CTE.** Step ⑦ uses `latest → existing → changed → closed → insert` in a single SQL statement. No row-by-row Python.
+**5. Slowly Changing Dimension Type 2 reconciliation in one CTE.** Helper 7 uses `latest → existing → changed → closed → insert` in a single SQL statement. No row-by-row Python.
 
-**Returns HTTP 202 + `job_id`** — matches the C-3 async contract even though the demo runs synchronously. Production path: enqueue, parallel workers, ~90 sec for 1 M rows.
+**Why both endpoints exist.** Hard PRE_FACT gating is **only possible in single-process sequential execution** — `/load-data` must be independently callable per Task B, so it cannot wait for `/compute-dq` to decide whether to write fact. `/pipeline` exists to recover the gating semantic by running both inside one orchestrator. The trade-off is documented; both are honest contracts.
 
 ---
 
@@ -577,22 +611,24 @@ See [`task_c_answers.md`](../Apple%20SDE/submission/task_c_answers.md) C.3 for f
 
 ## Slide 19 — Design Highlights I'm Proud Of
 
-**1. Three-stage DQ with severity-driven policy.** The architectural call I'd defend in any review:
+**1. Orchestrator + sub-modules with shared 9 helpers.** Task B requires 4 independently callable endpoints — that's Path B. But hard PRE_FACT gating fundamentally needs single-process sequential execution, so I added `POST /pipeline` as the orchestrator (Path A). Both paths invoke the **same 9 helper functions** in `api/services.py` — zero duplication; the only difference is orchestration order and the `gate` flag passed to `write_stg_to_fact`. Honest trade-off: Path A trades flexibility for stronger guarantees; Path B trades guarantees for granular control.
+
+**2. Three-stage DQ with severity-driven policy.** The architectural call I'd defend in any review:
    - INGEST stops at staging (parse errors)
-   - PRE_FACT blocks factual errors from entering fact
+   - PRE_FACT blocks factual errors from entering fact (Path A) or flags post-hoc (Path B)
    - SEMANTIC flags soft signals after fact write
 
-   **Result:** `fact_price_offer` is trustworthy by construction. Downstream analytics queries don't need filter views guarding against unresolved HIGH severity records.
+   **Result:** on Path A, `fact_price_offer` is trustworthy by construction — downstream analytics queries don't need filter views. On Path B, analytics use `LEFT JOIN dq_bad_records WHERE bad_record_id IS NULL` to filter; demonstrates why the orchestrator is worth the extra endpoint.
 
-**2. DQ rules are PL/pgSQL functions.** 13 rules executed in PostgreSQL, not Python. **One DB call replaces 13 M Python checks** at 1 M rows. Plus: `dq_rule_catalog` is metadata-driven — adding a rule = one INSERT, no code change.
+**3. DQ rules are PL/pgSQL functions.** 13 rules executed in PostgreSQL, not Python. **One DB call replaces 13 M Python checks** at 1 M rows. Plus: `dq_rule_catalog` is metadata-driven — adding a rule = one INSERT, no code change.
 
-**3. Explainable harmonise.** Three signals + structured override → every match has a transparent breakdown. Business reviewers can see *why* the matcher decided something, which is invaluable for triage. Vector embeddings would have been a black box.
+**4. Explainable harmonise.** Three signals + structured override → every match has a transparent breakdown. Business reviewers can see *why* the matcher decided something, which is invaluable for triage. Vector embeddings would have been a black box.
 
-**4. Visualization payload decoupled from rendering.** `/detect-anomalies` returns structured JSON, not images. Same payload feeds Chart.js dashboards, Slack alert cards, PDF reports — three consumers from one definition.
+**5. Visualization payload decoupled from rendering.** `/detect-anomalies` returns structured JSON, not images. Same payload feeds Chart.js dashboards, Slack alert cards, PDF reports — three consumers from one definition.
 
-**5. `fact_anomaly` one-row-per-signal (not per-offer).** An offer that trips multiple signals appears as multiple rows, each routable to a different team. Combining them into a composite would dilute or hide individual concerns.
+**6. `fact_anomaly` one-row-per-signal (not per-offer).** An offer that trips multiple signals appears as multiple rows, each routable to a different team. Combining them into a composite would dilute or hide individual concerns.
 
-**6. Adapting to a new partner is a configuration change, not a migration.** Adding Partner C = `INSERT INTO dim_partner`; new payment type = ALTER TYPE + new CTI child; new country = `INSERT INTO dim_country`. Star-schema decoupling pays off (full table on Slide 15 / Task C-1).
+**7. Adapting to a new partner is a configuration change, not a migration.** Adding Partner C = `INSERT INTO dim_partner`; new payment type = ALTER TYPE + new CTI child; new country = `INSERT INTO dim_country`. Star-schema decoupling pays off (full table on Slide 15 / Task C-1).
 
 ---
 
@@ -622,6 +658,8 @@ See [`task_c_answers.md`](../Apple%20SDE/submission/task_c_answers.md) C.3 for f
 
 | Question | Where to look |
 |----------|---------------|
+| Why an orchestrator (`/pipeline`) AND 4 sub-modules? Isn't that redundant? | Same 9 helpers, different orchestration. Sub-modules satisfy Task B's literal "4 independent endpoints"; orchestrator recovers hard PRE_FACT gating that's only possible in single-transaction sequential execution. Demonstrable cleanliness difference in `fact_price_offer`. |
+| Path A vs Path B — observable difference? | Same CSV: Path A → fact clean (gate filtered bad rows). Path B → fact contains flagged rows; analytics need `LEFT JOIN dq_bad_records WHERE bad_record_id IS NULL`. |
 | Why CTI not JSONB for payment? | `schema.sql` SECTION 2 (above `payment_type_enum`) |
 | Why monthly partition not daily? | `schema.sql` partitioning block (~line 470) |
 | Why three DQ stages, not two? | `task_b_answers.md` B.1 + `task_c_answers.md` C.2 |
