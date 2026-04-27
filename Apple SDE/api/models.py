@@ -160,9 +160,7 @@ class DQSummary(BaseModel):
 
 
 class ComputeDQRequest(BaseModel):
-    source_batch_id: UUID                  = Field(..., description="Run DQ checks against this ingestion batch")
-    rules:           Optional[List[str]]   = Field(default=None, description="Optional whitelist of rule_ids; default = all active")
-    stages:          Optional[List[str]]   = Field(default=None, description="Optional subset of INGEST / PRE_FACT / SEMANTIC; default = all three")
+    source_batch_id: UUID = Field(..., description="Run all 13 DQ rules against this ingestion batch")
 
 
 class ComputeDQResponse(BaseModel):
@@ -252,6 +250,33 @@ class DetectAnomaliesResponse(BaseModel):
     total_anomalies:    int
     by_severity:        AnomaliesBySeverity
     anomalies:          List[Anomaly]
+
+
+# ---------------------------------------------------------------------------
+# /pipeline — Path A orchestrator (one-click 9-step end-to-end)
+# ---------------------------------------------------------------------------
+
+class PipelineResponse(BaseModel):
+    """Aggregated result of the 9-step orchestrator.
+
+    The orchestrator interleaves the 4 sub-modules' work in the canonical
+    pipeline order (parse → ingest_dq → harmonise → prefact_dq → fact_write
+    with hard gate → semantic_dq → scd2 → anomaly_detection → summary).
+    Sub-module endpoints can replicate steps 1-9 in grouped fashion (see
+    /load-data, /compute-dq, /detect-anomalies); the orchestrator exists
+    for a one-shot call with strict PRE_FACT gating semantics.
+    """
+    job_id:                UUID
+    source_batch_id:       UUID
+    partner_code:          str
+    started_at:            datetime
+    completed_at:          datetime
+    rows_loaded:           int                  = Field(..., description="Rows in fact_price_offer for this batch")
+    rows_unchanged:        int                  = Field(..., description="Rows neither loaded to fact nor flagged bad")
+    rows_bad:              int                  = Field(..., description="Rows in dq_bad_records for this batch")
+    dq_summary:            DQSummary
+    anomalies_total:       int
+    anomalies_by_severity: AnomaliesBySeverity
 
 
 # ---------------------------------------------------------------------------

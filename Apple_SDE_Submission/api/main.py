@@ -1,8 +1,17 @@
 """
 FastAPI application — entry point.
 
-All four assignment endpoints + supporting endpoints for the async load
-workflow and business-user bad-records review.
+Architecture: one independent API service. Inside it:
+  • 4 Task-B sub-modules — POST /load-data, POST /compute-dq,
+    POST /detect-anomalies, GET /harmonise-product. Each is independently
+    callable and does ONE thing (a coherent group of pipeline steps).
+  • 1 orchestrator — POST /pipeline. Runs the canonical 9-step pipeline
+    end-to-end in interleaved order with the PRE_FACT hard gate enabled.
+
+Both paths share the same 9 internal step helpers in api/services.py — zero
+code duplication. Path A (/pipeline) hard-gates bad rows out of fact_price_offer.
+Path B (sub-modules called individually) covers all 9 steps but the gate
+degrades to post-hoc flagging in dq_bad_records.
 
 Run from the unzipped project folder (containing this README):
     uvicorn api.main:app --reload --port 8000
@@ -21,7 +30,6 @@ from uuid import UUID
 from fastapi import (
     FastAPI, File, Form, HTTPException, Path, Query, UploadFile, status,
 )
-from fastapi.responses import JSONResponse
 
 from . import services
 from .db import close_pool, init_pool
@@ -29,7 +37,8 @@ from .models import (
     BadRecordList, BadRecordStatus, ComputeDQRequest, ComputeDQResponse,
     Confidence, DetectAnomaliesRequest, DetectAnomaliesResponse,
     ErrorResponse, HarmoniseResponse, LoadDataAcceptedResponse, LoadJobStatus,
-    ResolveBadRecordRequest, ResolveBadRecordResponse, Severity,
+    PipelineResponse, ResolveBadRecordRequest, ResolveBadRecordResponse,
+    Severity,
 )
 
 # ---------------------------------------------------------------------------
@@ -51,78 +60,90 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Pricing Pipeline API",
     description=(
-        "API (Application Programming Interface) for the partner-store pricing "
-        "ingestion + analysis system."
+        "Multi-partner pricing ingestion + harmonisation + Data Quality "
+        "+ anomaly detection.\n\n"
+        "**Path A — POST /pipeline**: one-click 9-step orchestrator.\n"
+        "**Path B — sub-modules**: /load-data, /compute-dq, /detect-anomalies, "
+        "/harmonise-product. Independently callable; combine in sequence to "
+        "cover the same 9 steps with degraded gating semantics."
     ),
-    version="0.1.0",
+    version="0.2.0",
     contact={"name": "huizhongwu"},
     lifespan=lifespan,
 )
 
 
-# OPTIONAL — not required by the assignment. Standard production practice
-# for container-orchestration platforms (Kubernetes / ECS / ALB) which call
-# this endpoint to decide whether the service is alive and should receive
-# traffic. Safe to remove if not deploying to such a platform.
 @app.get("/health", tags=["meta"], summary="Liveness probe")
 def health():
+    """Standard liveness probe for container-orchestration platforms."""
     return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
 
 
-# ---------------------------------------------------------------------------
-# /harmonise-product — assignment endpoint #4
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Path A — POST /pipeline (orchestrator)
+# ===========================================================================
 
-@app.get(
-    "/harmonise-product",
-    tags=["harmonise"],
-    response_model=HarmoniseResponse,
-    summary="Harmonise a raw product name to canonical model(s)",
+@app.post(
+    "/pipeline",
+    tags=["pipeline"],
+    response_model=PipelineResponse,
+    responses={400: {"model": ErrorResponse}},
+    summary="One-click orchestrator — runs all 9 steps end-to-end",
     description=(
-        "Returns up to **k** ranked candidate matches for a partner-supplied "
-        "product name. Each candidate has a 0-1 score, a confidence bucket "
-        "(HIGH / MEDIUM / LOW / MANUAL) and a per-signal breakdown for "
-        "explainability."
+        "Runs the canonical 9-step pipeline in interleaved order:\n\n"
+        "  1. Parse CSV → `stg_price_offer`\n"
+        "  2. INGEST-stage Data Quality\n"
+        "  3. Harmonise raw product names\n"
+        "  4. PRE_FACT-stage Data Quality (HIGH-severity gate)\n"
+        "  5. Insert into `fact_price_offer` + payment child "
+        "(**only PRE_FACT-passing rows**)\n"
+        "  6. SEMANTIC-stage Data Quality (soft signals; flag-and-keep)\n"
+        "  7. Update Slowly Changing Dimension Type 2 history\n"
+        "  8. Detect pricing anomalies on the new batch\n"
+        "  9. Write per-batch summary to `dws_partner_dq_per_batch`\n\n"
+        "Single transaction. PRE_FACT bad rows are hard-blocked from `fact_price_offer`. "
+        "Equivalent to calling /load-data + /compute-dq + /detect-anomalies in "
+        "sequence except for stronger gating semantics (the sub-module path "
+        "lets bad rows enter fact and flags them post-hoc)."
     ),
 )
-def harmonise_product(
-    q:               str        = Query(..., min_length=1, description="Raw product name to harmonise"),
-    k:               int        = Query(5,  ge=1, le=20, description="Number of candidates to return"),
-    min_confidence:  Confidence = Query(Confidence.LOW, description="Minimum confidence bucket"),
+async def pipeline(
+    file:         UploadFile = File(..., description="CSV file"),
+    partner_code: str        = Form(..., description="Partner identifier registered in dim_partner"),
 ):
-    return services.harmonise_product(q, k, min_confidence)
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(400, "Only .csv files are accepted")
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(400, "Empty file")
+    return await services.run_pipeline(contents, partner_code)
 
 
-# ---------------------------------------------------------------------------
-# /load-data — assignment endpoint #1 (async-first)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Path B — sub-module endpoints (Task B endpoints)
+# ===========================================================================
+
+# ---------- POST /load-data — Task B endpoint #1 ----------
 
 @app.post(
     "/load-data",
-    tags=["ingest"],
+    tags=["load-data"],
     status_code=status.HTTP_202_ACCEPTED,
     response_model=LoadDataAcceptedResponse,
     responses={400: {"model": ErrorResponse}},
-    summary="Submit a CSV (Comma-Separated Values) batch and run the full ingest pipeline",
+    summary="Load CSV into the table (parse + harmonise + write fact + Slowly Changing Dimension Type 2)",
     description=(
-        "Accepts a multipart upload and runs the eight-step ingest pipeline "
-        "in-process:\n\n"
+        "Task B sub-module — covers pipeline steps **1, 3, 5, 7, 9**:\n\n"
         "  1. Parse CSV into `stg_price_offer`\n"
-        "  2. Run INGEST-stage Data Quality rules (parse / format / required-field)\n"
         "  3. Harmonise raw product names against the canonical registry\n"
-        "  4. Run PRE_FACT-stage Data Quality rules (HIGH-severity gate); failing "
-        "rows are flagged in `dq_bad_records` and do NOT enter fact tables\n"
         "  5. Insert change events into `fact_price_offer` + payment child "
-        "(only PRE_FACT-passing rows)\n"
-        "  6. Run SEMANTIC-stage Data Quality rules on fact rows (soft signals; "
-        "failures stay in fact and are flagged for review)\n"
+        "(**no PRE_FACT gate** — all rows with parseable fields enter fact; "
+        "Data Quality flagging happens post-hoc via /compute-dq)\n"
         "  7. Update Slowly Changing Dimension Type 2 history\n"
-        "  8. Write per-batch summary to `dws_partner_dq_per_batch`\n\n"
-        "Returns `HTTP 202 Accepted` with a `job_id`. At sample-data scale "
-        "(~4 000 rows) processing completes in seconds, so the response "
-        "status is `COMPLETED` on return. The full async-queue + parallel-"
-        "worker + AWS S3 (Amazon Simple Storage Service) staging path for "
-        "million-row scale is the production design (see `task_c_answers.md` C.3)."
+        "  9. Write batch summary\n\n"
+        "Steps 2/4/6 (Data Quality) and step 8 (anomaly detection) are NOT run here — "
+        "call /compute-dq and /detect-anomalies separately, or use POST /pipeline "
+        "for end-to-end with hard gating."
     ),
 )
 async def load_data(
@@ -139,7 +160,7 @@ async def load_data(
 
 @app.get(
     "/load-data/{job_id}",
-    tags=["ingest"],
+    tags=["load-data"],
     response_model=LoadJobStatus,
     responses={404: {"model": ErrorResponse}},
     summary="Poll the progress / status of a load job",
@@ -150,26 +171,33 @@ def get_load_job(
     return services.get_job_status(job_id)
 
 
-# ---------------------------------------------------------------------------
-# /compute-dq — assignment endpoint #2
-# ---------------------------------------------------------------------------
+# ---------- POST /compute-dq — Task B endpoint #2 ----------
 
 @app.post(
     "/compute-dq",
-    tags=["data-quality"],
+    tags=["compute-dq"],
     response_model=ComputeDQResponse,
-    summary="Run Data Quality (DQ) rules against an ingestion batch",
+    summary="Validate Data Quality — runs all 13 rules and writes to dq_output + dq_bad_records",
     description=(
-        "Executes all active rules in `dq_rule_catalog` against the specified "
-        "batch. Aggregates per-rule pass rates into `dq_output` and per-record "
-        "violations into `dq_bad_records`.\n\n"
-        "Optionally restrict to specific `rules` and/or `stages` "
-        "(INGEST / PRE_FACT / SEMANTIC)."
+        "Task B sub-module — covers pipeline steps **2, 4, 6, 9**:\n\n"
+        "  2. INGEST-stage Data Quality (parse / format / required-field rules)\n"
+        "  4. PRE_FACT-stage Data Quality (country↔currency, partner↔country, harmonise match)\n"
+        "  6. SEMANTIC-stage Data Quality (soft signals — low-confidence harmonise, "
+        "category sanity bounds)\n"
+        "  9. Refresh batch summary\n\n"
+        "All 13 rules execute against the batch. Per-rule pass rates are "
+        "stored in **`dq_output`**; per-row violations (with the original CSV "
+        "payload preserved as JSONB) are stored in **`dq_bad_records`**.\n\n"
+        "Designed to be called AFTER /load-data has populated fact_price_offer. "
+        "PRE_FACT-failing rows are flagged post-hoc — they remain in fact and "
+        "must be filtered via `LEFT JOIN dq_bad_records` if downstream queries "
+        "need a clean view. For end-to-end execution with hard gating, use "
+        "POST /pipeline instead."
     ),
 )
 async def compute_dq(req: ComputeDQRequest):
     started = datetime.now(timezone.utc)
-    summary, rule_runs = await services.compute_dq(req.source_batch_id, req.rules, req.stages)
+    summary, rule_runs = await services.compute_dq_service(req.source_batch_id)
     completed = datetime.now(timezone.utc)
     return ComputeDQResponse(
         source_batch_id = req.source_batch_id,
@@ -180,35 +208,57 @@ async def compute_dq(req: ComputeDQRequest):
     )
 
 
-# ---------------------------------------------------------------------------
-# /detect-anomalies — assignment endpoint #3
-# ---------------------------------------------------------------------------
+# ---------- POST /detect-anomalies — Task B endpoint #3 ----------
 
 @app.post(
     "/detect-anomalies",
-    tags=["anomaly-detection"],
+    tags=["detect-anomalies"],
     response_model=DetectAnomaliesResponse,
-    summary="Detect pricing anomalies",
+    summary="Detect pricing anomalies + return visualization payload",
     description=(
-        "Runs the four-signal detector (STATISTICAL / TEMPORAL / "
-        "CROSS_PARTNER / SKU_VARIANCE) over the specified scope.\n\n"
-        "Each row in the response represents a single triggered signal — an "
-        "offer that trips multiple signals appears as multiple anomaly "
-        "entries, each routable to the appropriate team (see "
-        "`fact_anomaly` in schema.sql).\n\n"
-        "All thresholds are read from `dim_anomaly_threshold` and frozen "
-        "into the response context for replay/audit."
+        "Task B sub-module — covers pipeline step **8** (and refreshes step 9 summary).\n\n"
+        "For each offer in scope, compares its USD price against the 30-day "
+        "rolling mean from `fact_partner_price_history` (the Slowly Changing "
+        "Dimension Type 2 table). Returns the anomaly list with severity "
+        "classification (HIGH ≥25%, MEDIUM ≥15%, LOW ≥10%) and a structured "
+        "visualization payload (time series + baseline band + cross-partner "
+        "comparison) that the frontend can render directly via Chart.js / Recharts."
     ),
 )
 async def detect_anomalies(req: DetectAnomaliesRequest):
     if not req.source_batch_id and not req.date_range:
         raise HTTPException(400, "Must specify either source_batch_id or date_range")
-    return await services.detect_anomalies(req)
+    return await services.detect_anomalies_service(req)
 
 
-# ---------------------------------------------------------------------------
-# /bad-records — business-user review workflow (Task C-2 hook)
-# ---------------------------------------------------------------------------
+# ---------- GET /harmonise-product — Task B endpoint #4 ----------
+
+@app.get(
+    "/harmonise-product",
+    tags=["harmonise-product"],
+    response_model=HarmoniseResponse,
+    summary="Harmonise a raw product name to canonical model(s) — Top-K + score",
+    description=(
+        "Task B sub-module — exposes the harmoniser as an ad-hoc lookup. "
+        "Returns up to **k** ranked candidate matches for a partner-supplied "
+        "product name. Each candidate has a 0-1 score, a confidence bucket "
+        "(HIGH / MEDIUM / LOW / MANUAL) and a per-signal breakdown for "
+        "explainability.\n\n"
+        "Internally, pipeline step 3 (`harmonise_in_stg`) calls this same "
+        "harmoniser for every staged row during /load-data and /pipeline."
+    ),
+)
+def harmonise_product(
+    q:               str        = Query(..., min_length=1, description="Raw product name to harmonise"),
+    k:               int        = Query(5,  ge=1, le=20, description="Number of candidates to return"),
+    min_confidence:  Confidence = Query(Confidence.LOW, description="Minimum confidence bucket"),
+):
+    return services.harmonise_product(q, k, min_confidence)
+
+
+# ===========================================================================
+# Bad-records review workflow (supporting /compute-dq output)
+# ===========================================================================
 
 @app.get(
     "/bad-records",

@@ -16,7 +16,12 @@ A REST API that:
 4. **stores** every meaningful price event in a Kimball star-schema with bi-temporal price history (Slowly Changing Dimension Type 2),
 5. **detects** pricing anomalies with severity + a visualisation payload.
 
-All four assignment endpoints (`/load-data`, `/compute-dq`, `/detect-anomalies`, `/harmonise-product`) are implemented and live behind Swagger UI at `/docs`.
+The API service exposes **two call paths** sharing the same 9 internal step helpers:
+
+- **Path A — `POST /pipeline`** — one-click orchestrator: runs the full 9-step pipeline end-to-end with the PRE_FACT hard gate (bad rows do NOT enter `fact_price_offer`).
+- **Path B — 4 Task-B sub-modules** — `POST /load-data`, `POST /compute-dq`, `POST /detect-anomalies`, `GET /harmonise-product`. Each independently callable; same 9 steps, but the gate degrades to post-hoc flagging in `dq_bad_records`.
+
+All five endpoints live behind Swagger UI at `/docs`.
 
 ---
 
@@ -93,7 +98,8 @@ python3 seed_bootstrap.py                       # Product Reference + Foreign Ex
 
 ```bash
 python3 -m pytest -q
-#    → 39 passed in ~1 second (22 harmonise unit + 17 API integration)
+#    → 44 passed in ~1 second (22 harmonise unit + 22 API integration covering
+#      Path A pipeline + 4 Path B sub-modules + path-parity tests)
 ```
 
 ### Step 7 — Start the API
@@ -108,58 +114,85 @@ python3 -m uvicorn api.main:app --port 8000
 
 ## End-to-end smoke test
 
+### Path A — one-click `POST /pipeline` (9 steps with hard gate)
+
 ```bash
-# Load both partners
-curl -X POST http://localhost:8000/load-data \
+curl -X POST http://localhost:8000/pipeline \
      -F "file=@Partner A.csv" -F "partner_code=PARTNER_A"
+# → returns aggregated PipelineResponse (rows_loaded, rows_bad,
+#   dq_summary, anomalies_total, anomalies_by_severity)
+# → fact_price_offer holds only PRE_FACT-passing rows
+```
 
-curl -X POST http://localhost:8000/load-data \
-     -F "file=@Partner B.csv" -F "partner_code=PARTNER_B"
+### Path B — 4 Task-B sub-modules in sequence (9 steps with post-hoc flagging)
 
-# Harmonise (algorithm only, no DB lookup)
-curl "http://localhost:8000/harmonise-product?q=iP+17+PM+512GB&k=5"
+```bash
+# Step 1 — load (parse + harmonise + write fact NO gate + Slowly Changing Dimension Type 2)
+LOAD=$(curl -s -X POST http://localhost:8000/load-data \
+       -F "file=@Partner B.csv" -F "partner_code=PARTNER_B")
+BATCH=$(echo "$LOAD" | python3 -c "import sys,json; print(json.load(sys.stdin)['source_batch_id'])")
+echo "batch=$BATCH"
 
-# Replace <batch_id> with a value returned by /load-data
+# Step 2 — Validate Data Quality (13 rules → dq_output + dq_bad_records)
 curl -X POST http://localhost:8000/compute-dq \
      -H "Content-Type: application/json" \
-     -d '{"source_batch_id": "<batch_id>"}'
+     -d "{\"source_batch_id\": \"$BATCH\"}"
 
+# Step 3 — Detect anomalies (returns visualization payload)
 curl -X POST http://localhost:8000/detect-anomalies \
      -H "Content-Type: application/json" \
-     -d '{"source_batch_id": "<batch_id>", "min_severity": "MEDIUM"}'
+     -d "{\"source_batch_id\": \"$BATCH\", \"min_severity\": \"MEDIUM\"}"
 
+# Ad-hoc — Harmonise a single product (algorithm only, no DB lookup)
+curl "http://localhost:8000/harmonise-product?q=iP+17+PM+512GB&k=5"
+
+# Bad-records review queue (Task C-2 hook)
 curl "http://localhost:8000/bad-records?status=NEW&page_size=10"
 ```
+
+The two paths cover the same 9 logical steps but differ in gating: Path A blocks PRE_FACT-failing rows from `fact_price_offer`; Path B writes them to fact and flags them in `dq_bad_records` (analytics queries filter via `LEFT JOIN dq_bad_records WHERE bad_record_id IS NULL`).
 
 ---
 
 ## Architecture (one-page view)
 
 ```
-   Partner CSVs
+   Partner CSV  +  partner_code
         │
         ▼
-   POST /load-data ──► stg_price_offer
-                              │
-                              │ 8-step pipeline
-                              ▼
-        INGEST DQ ─► Harmonise ─► PRE_FACT DQ (HIGH-severity gate)
-                              │
-                              │ only PRE_FACT-passing rows
-                              ▼
-                      fact_price_offer (+ payment child tables, CTI)
-                              │
-                              │ SEMANTIC DQ (soft signals; flag-and-keep)
-                              ▼
-              fact_partner_price_history (Slowly Changing Dimension Type 2)
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ FastAPI service                                                 │
+  │                                                                 │
+  │  Path A — POST /pipeline  (orchestrator, hard gate)             │
+  │    1 → 2 → 3 → 4 → 5(gate) → 6 → 7 → 8 → 9                      │
+  │              └──── PRE_FACT bad rows blocked here ────┘         │
+  │                                                                 │
+  │  Path B — Task B sub-modules (each independently callable)      │
+  │    POST /load-data       steps 1, 3, 5(no gate), 7, 9           │
+  │    POST /compute-dq      steps 2, 4, 6, 9                       │
+  │    POST /detect-anomalies step 8                                │
+  │    GET  /harmonise-product (algorithm only — also used by step 3)│
+  │                                                                 │
+  │  Both paths call the SAME 9 step helpers in api/services.py     │
+  └─────────────────────────────────────────────────────────────────┘
 
-   POST /compute-dq        ─► dq_output + dq_bad_records
-   POST /detect-anomalies  ─► time series + baseline band + cross-partner panel
-   GET  /harmonise-product ─► in-memory Harmoniser (Top-K + score)
-   GET  /bad-records       ─► business review queue (resolve + replay)
+   9 steps:
+     1. Parse CSV          ─► stg_price_offer
+     2. INGEST DQ          ─► dq_output + dq_bad_records
+     3. Harmonise          ─► back into stg_price_offer
+     4. PRE_FACT DQ        ─► dq_output + dq_bad_records
+     5. Write fact         ─► fact_price_offer + payment children (Class Table Inheritance)
+     6. SEMANTIC DQ        ─► dq_output + dq_bad_records (flag-and-keep)
+     7. Slowly Changing Dimension Type 2  ─► fact_partner_price_history
+     8. Detect anomalies   ─► response payload (time series + baseline band)
+     9. Batch summary      ─► dws_partner_dq_per_batch
+
+   GET /bad-records          ─► business review queue (resolve + replay)
 ```
 
-**Three-stage DQ rationale.** `INGEST` catches parse/format failures on raw staging. `PRE_FACT` is a HIGH-severity gate that blocks factually wrong rows (country↔currency, partner↔country, harmonise unmatched) from ever reaching `fact_price_offer` — so analytics queries can trust the fact table directly without filter views. `SEMANTIC` runs *after* fact write on single-row soft signals (low-confidence harmonise, category sanity bounds) where business judgment is needed; failing rows stay in fact and are flagged for review. Cross-row pricing patterns (variance, temporal jumps, cross-partner divergence) live in `/detect-anomalies`, not here.
+**Three-stage DQ rationale.** `INGEST` catches parse/format failures on raw staging. `PRE_FACT` is a HIGH-severity gate that blocks factually wrong rows (country↔currency, partner↔country, harmonise unmatched) from ever reaching `fact_price_offer` **on Path A** — so analytics queries can trust the fact table directly without filter views. On Path B, the gate degrades to post-hoc flagging (bad rows enter fact, analytics filter via `LEFT JOIN dq_bad_records`). `SEMANTIC` runs *after* fact write on single-row soft signals (low-confidence harmonise, category sanity bounds) where business judgment is needed; failing rows stay in fact and are flagged for review. Cross-row pricing patterns (variance, temporal jumps, cross-partner divergence) live in `/detect-anomalies`, not here.
+
+**Why both paths exist.** Task B requires 4 independently callable endpoints — that gives Path B. The orchestrator (`/pipeline`) exists because hard PRE_FACT gating is only possible in a single-process sequential execution: `/load-data` must be independently callable, so it cannot wait for `/compute-dq` to decide whether to write fact. Path A trades flexibility for stronger guarantees; Path B trades guarantees for granular control.
 
 ---
 
