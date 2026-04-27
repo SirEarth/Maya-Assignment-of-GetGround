@@ -14,9 +14,9 @@
 | 3 | Technical architecture & pipeline diagrams | 5–6 | 5 min |
 | 4 | Task A — Database design (requirements → schema mapping) | 7–9 | 6 min |
 | 5 | Task B endpoint design deep-dive | 10–14 | 15 min |
-| 6 | Task C-3 scaling to 1 M records | 15 | 5 min |
-| 7 | Reflection — challenges / highlights / next steps | 16–18 | 8 min |
-| 8 | Q&A | 19–21 | 30 min |
+| 6 | Task C — three technical write-ups (C-1 / C-2 / C-3) | 15–17 | 6 min |
+| 7 | Reflection — challenges / highlights / next steps | 18–20 | 8 min |
+| 8 | Q&A | 21–23 | 30 min |
 
 ---
 
@@ -475,11 +475,57 @@ Same payload feeds Chart.js, Slack cards, PDF reports — frontend does the draw
 
 ---
 
-# §6 · Task C-3 — Scaling to 1 Million Records (5 min)
+# §6 · Task C — Three Technical Write-ups (6 min)
+
+The brief asks three specific questions in Task C. Concise answers below; full version in [`submission/task_c_answers.md`](../Apple%20SDE/submission/task_c_answers.md).
 
 ---
 
-## Slide 15 — Scaling to 1 M Records
+## Slide 15 — Task C-1: Adapting to New Partners
+
+**Q.** *How does the data model adjust when new partner store data is inducted?*
+
+The Kimball star schema isolates partner change to a **single dimension row**. Fact tables stay stable for years.
+
+| Change | What needs to happen | Schema impact |
+|--------|----------------------|---------------|
+| **New partner, existing payment scheme** | `INSERT INTO dim_partner` (one row) | **None.** Existing `fact_price_offer` rows route to the new `partner_id` automatically. |
+| **New payment type** (e.g. Buy Now Pay Later) | `ALTER TYPE payment_type_enum ADD VALUE 'BNPL'` + `CREATE TABLE fact_payment_bnpl` (CTI child) | One new child table; **existing rows untouched.** Class Table Inheritance is the payoff. |
+| **New country** | `INSERT INTO dim_country` (+ `dim_timezone` if a new IANA zone) | **None on facts.** |
+| **Unknown product category in partner feed** | Detected by `DQ_HARM_002` (PRE_FACT gate) → `dq_bad_records` → business review. If legitimate, Apple catalog team adds to Product Reference, then `INSERT INTO dim_product_category`, replay batch. **Never auto-discovered.** | **None on facts.** Bad rows never reach `fact_price_offer`. |
+
+**The takeaway.** Dimensions are designed to absorb business change; fact schemas stay stable for years. New partners onboard via configuration, not migrations — that is the star-schema's primary payoff.
+
+---
+
+## Slide 16 — Task C-2: Error Handling + Data Quality Strategy
+
+**Q.** *Design an error handling and data quality strategy that may involve business users to perform correction action.*
+
+Three-tier closure loop. Detection is automated, triage is business-driven, and the system **learns** from each correction.
+
+**Tier 1 — Automated detection (zero human in the loop)**
+- Every `POST /load-data` runs **13 DQ rules** in three stages:
+  - **INGEST** (8 rules) — null / format / range / conditional checks on raw staging
+  - **PRE_FACT** (3 HIGH-severity rules) — country↔currency, partner↔country, harmonise unmatched. **Failing rows blocked from fact_price_offer.**
+  - **SEMANTIC** (2 rules) — low-confidence harmonise + category sanity. Flag-and-keep on fact.
+- Failing records → `dq_bad_records` with `raw_payload` JSONB preserving the **full original CSV row**.
+
+**Tier 2 — Business-user triage (visual review interface)**
+- `GET /bad-records?status=NEW` lists open items with raw payload + failed rule + severity
+- Reviewer picks an action via `POST /bad-records/{id}/resolve`:
+  - **`RESOLVED + replay_batch=true`** — fix the dictionary or rule, surgically re-ingest just that `source_batch_id` (not full reload)
+  - **`IGNORED`** — close the ticket without changing data
+- Workflow state on the row (`status`, `assignee`, `resolved_at`, `resolution_notes`) — full audit trail.
+
+**Tier 3 — Learning loop**
+- Resolved records feed back: harmonise dictionary additions (Layer 3), threshold tuning in `dim_anomaly_threshold`, new DQ rules when patterns emerge.
+
+**Real example — the 154-row NZ story.** Partner B shipped 154 rows with `COUNTRY_VAL = "NZ"` (ISO code, not full name `"New Zealand"`). `DQ_FMT_001` flagged them. Reviewer saw both forms are legitimate; resolver was hardcoded to full names. Fix: extend `_COUNTRY_NAME_MAP` to accept ISO codes; replay; **all 154 rows promoted to fact_price_offer cleanly.** **DQ → rule iteration → replay loop in action.**
+
+---
+
+## Slide 17 — Task C-3: Scaling to 1 M Records
 
 **Current sync flow:** 3–7 hours for 1 M rows; HTTP times out long before completion.
 
@@ -509,7 +555,7 @@ See [`task_c_answers.md`](../Apple%20SDE/submission/task_c_answers.md) C.3 for f
 
 ---
 
-## Slide 16 — Challenges & Iterations
+## Slide 18 — Challenges & Iterations
 
 **Things that turned out harder than expected:**
 
@@ -529,7 +575,7 @@ See [`task_c_answers.md`](../Apple%20SDE/submission/task_c_answers.md) C.3 for f
 
 ---
 
-## Slide 17 — Design Highlights I'm Proud Of
+## Slide 19 — Design Highlights I'm Proud Of
 
 **1. Three-stage DQ with severity-driven policy.** The architectural call I'd defend in any review:
    - INGEST stops at staging (parse errors)
@@ -546,18 +592,11 @@ See [`task_c_answers.md`](../Apple%20SDE/submission/task_c_answers.md) C.3 for f
 
 **5. `fact_anomaly` one-row-per-signal (not per-offer).** An offer that trips multiple signals appears as multiple rows, each routable to a different team. Combining them into a composite would dilute or hide individual concerns.
 
-**6. Adapting to a new partner is a configuration change, not a migration.** Adding Partner C = INSERT one row in `dim_partner`. Star-schema decoupling pays off.
-
-| Change | What happens | Schema impact |
-|--------|--------------|---------------|
-| New partner, existing payment scheme | `INSERT INTO dim_partner` | **None** |
-| New payment type (e.g. BNPL) | `ALTER TYPE payment_type_enum ADD VALUE`; `CREATE TABLE fact_payment_bnpl` | One new child table |
-| New country | `INSERT INTO dim_country` + `dim_timezone` | **None** |
-| Unknown product category | `DQ_HARM_002` flags → review → catalog adds to Reference → replay | **None on facts** |
+**6. Adapting to a new partner is a configuration change, not a migration.** Adding Partner C = `INSERT INTO dim_partner`; new payment type = ALTER TYPE + new CTI child; new country = `INSERT INTO dim_country`. Star-schema decoupling pays off (full table on Slide 15 / Task C-1).
 
 ---
 
-## Slide 18 — What I'd Build Differently
+## Slide 20 — What I'd Build Differently
 
 **1. Three remaining anomaly signals.** TEMPORAL / CROSS_PARTNER / SKU_VARIANCE — schemas and response shapes are in place; their detector branches are scoped as future work. The visualization helper is signal-agnostic and reusable.
 
@@ -577,7 +616,7 @@ See [`task_c_answers.md`](../Apple%20SDE/submission/task_c_answers.md) C.3 for f
 
 ---
 
-## Slide 19 — Q&A Cheat Sheet
+## Slide 21 — Q&A Cheat Sheet
 
 **Likely deep-dive questions and where the answer lives:**
 
@@ -599,7 +638,7 @@ See [`task_c_answers.md`](../Apple%20SDE/submission/task_c_answers.md) C.3 for f
 
 ---
 
-## Slide 20 — Technical Glossary
+## Slide 22 — Technical Glossary
 
 ### Q1 — How does a country value flow through the pipeline?
 
@@ -644,7 +683,7 @@ In the demo we keep ingest synchronous within the request handler. Production de
 
 ---
 
-## Slide 21 — Closing
+## Slide 23 — Closing
 
 **Three takeaways:**
 

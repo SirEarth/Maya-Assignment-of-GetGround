@@ -14,7 +14,7 @@
 | 3 | 技术架构图 + 业务流程图 | 5 min |
 | 4 | **Task A · 数据库设计**(需求→schema 映射) | 6 min |
 | 5 | Task B 4 个核心接口详细设计 | 15 min |
-| 6 | C3 百万级扩展方案 | 5 min |
+| 6 | Task C 三个回答(C-1 / C-2 / C-3) | 6 min |
 | 7 | 反思:挑战 / 亮点 / 可优化 | 8 min |
 | 8 | Q&A | 30 min |
 
@@ -390,7 +390,7 @@ CREATE TABLE fact_payment_instalment (
 
 ## §5 Task B 4 个核心接口详细设计(15 min)
 
-### 4a · `GET /harmonise-product`(3 min)
+### 5a · `GET /harmonise-product`(3 min)
 
 **指代码:** [`harmonise/`](../Apple%20SDE/harmonise/) 6 个模块。
 
@@ -412,7 +412,7 @@ score = 0.5 × attr_match + 0.3 × token_jaccard + 0.2 × char_fuzz_ratio
 >
 > **中文备注:** 不用 ML;三信号加权;281 行参考用 ML 是过度工程;DQ 审核需要可解释。
 
-### 4b · `POST /load-data`(5 min · 重头戏)
+### 5b · `POST /load-data`(5 min · 重头戏)
 
 **指代码:** [`api/services.py:122`](../Apple%20SDE/api/services.py#L122) 朗读 docstring。
 
@@ -426,7 +426,7 @@ score = 0.5 × attr_match + 0.3 × token_jaccard + 0.2 × char_fuzz_ratio
 **台词:**
 > *"Single Postgres transaction wraps all 8 steps — atomicity gives us 'all or nothing'. The three-stage DQ split is the key design call: HIGH severity blocks at PRE_FACT before fact insert, MEDIUM/LOW flags-but-keeps after. Class Table Inheritance — payment-specific NOT NULL constraints become real instead of sparse columns. SCD-2 history compresses observation events into change events."*
 
-### 4c · `POST /compute-dq`(3 min)
+### 5c · `POST /compute-dq`(3 min)
 
 **指代码:** [`dq/rules.sql`](../Apple%20SDE/dq/rules.sql)(19 条 PL/pgSQL 函数)+ [`dq/rules_split.sql`](../Apple%20SDE/dq/rules_split.sql)(3 个 stage 编排器)。
 
@@ -448,7 +448,7 @@ score = 0.5 × attr_match + 0.3 × token_jaccard + 0.2 × char_fuzz_ratio
 >
 > **中文备注:** 19 条 SQL 函数;catalog driven 加规则不写代码;3-stage + severity policy 是设计亮点。
 
-### 4d · `POST /detect-anomalies`(4 min)
+### 5d · `POST /detect-anomalies`(4 min)
 
 **指代码:** [`api/services.py:691`](../Apple%20SDE/api/services.py#L691) `detect_anomalies` + `_build_anomaly_visualization`。
 
@@ -477,13 +477,52 @@ score = 0.5 × attr_match + 0.3 × token_jaccard + 0.2 × char_fuzz_ratio
 
 ---
 
-## §6 C3 百万级扩展方案(5 min)
+## §6 Task C 三个回答(6 min)
 
-**对应 Slide 15 / `submission/task_c_answers.md` C.3。不要 Live Demo,直接走表。**
+**对应:** [`presentation.md`](presentation.md) Slide 15–17 / `submission/task_c_answers.md` C.1 + C.2 + C.3。**全节不要 Live Demo,直接走 3 张幻灯片。**
+
+### 6a · Task C-1:新 partner 接入数据模型怎么变(看 Slide 15)
+
+**核心答:** 维度表加行,fact 表不动 —— Kimball 解耦的红利。
+
+| 变更 | 怎么做 | schema 影响 |
+|---|---|---|
+| 新 partner | `INSERT INTO dim_partner` 一行 | **无** |
+| 新支付方式(BNPL) | `ALTER TYPE payment_type_enum` + 新 CTI 子表 | 一个新子表;旧数据零影响 |
+| 新国家 | `INSERT INTO dim_country` (+ dim_timezone) | **无** |
+| Partner 数据出现未知品类 | `DQ_HARM_002` 抓 → 业务审 → catalog 加 → replay | **无 fact 影响**(rows 永不进 fact) |
+
+**台词:**
+> *"Five-row table maps every kind of partner-side change to a dimension-only edit. Class Table Inheritance + harmonise gate make 'fact tables stay stable for years' literally true. New partners onboard via configuration, not migrations."*
+>
+> **中文备注:** 5 类变更全部映射到维度表的 INSERT/ALTER,fact 表稳定不动。CTI + harmonise gate 让"fact 多年不动"是真的。
+
+### 6b · Task C-2:错误处理 + 业务参与的 DQ 闭环(看 Slide 16)
+
+**核心答:** 三层闭环 — 自动检测 → 业务裁决 → 系统学习。
+
+```
+Tier 1 (自动)        Tier 2 (业务)              Tier 3 (学习)
+13 DQ rules    ───►  reviewer 看 dq_bad_records  ───►  字典扩、阈值调、新规则
+3 stages              raw_payload 完整保留               下批自动变好
+                      RESOLVED + replay_batch
+                      / IGNORED
+```
+
+**关键支撑:** raw_payload JSONB 永不丢、replay 只重跑那一个 source_batch_id、status 字段做 NEW→IN_REVIEW→RESOLVED/IGNORED 工作流。
+
+**台词:**
+> *"Three-tier closure. Tier 1 catches everything automatically, Tier 2 gives the business a UI to fix dictionary or thresholds without code, Tier 3 makes the next batch better. The 154-row NZ story we already told in §2 is exactly this loop in action — DQ flagged, business saw raw_payload, fix was a one-line dictionary extension, replay promoted all 154 rows."*
+>
+> **中文备注:** 三层闭环;NZ 154 行就是这个闭环跑通的真实例子(§2 已演示)。
+
+### 6c · Task C-3:百万级扩展方案(看 Slide 17)
+
+**当前同步流:** 3-7 小时,HTTP 早超时。**5 项改造,3 项已实现:**
 
 | # | 改造 | 状态 |
 |---|---|:---:|
-| 1 | 异步流水线(HTTP 202 + S3 + ingest_job 表 + 分块 worker pool) | 设计 |
+| 1 | 异步流水线(HTTP 202 + S3 + ingest_job + 分块 worker pool) | 设计 |
 | 2 | PostgreSQL `COPY` 替代 `INSERT`(50–100× 加速) | 设计 |
 | 3 | DQ 规则在 SQL 里跑(一次 DB 调用代替 13 M Python 检查) | ✅ 已实现 |
 | 4 | 参考数据驻内存(零 per-row DB 查询) | ✅ 部分实现 |
@@ -500,14 +539,14 @@ score = 0.5 × attr_match + 0.3 × token_jaccard + 0.2 × char_fuzz_ratio
 
 ## §7 反思:挑战 / 亮点 / 可优化(8 min)
 
-### 6a · 主要挑战(3 min)
+### 7a · 主要挑战(3 min)
 
 1. **Schema 反复迭代** —— 一开始按"宽表 + sparse 列"画支付,意识到 sparse 不符合题目要求后改 CTI;DQ 一开始两阶段后扩成三阶段(增加 PRE_FACT gate)
 2. **Harmonise 兜底逻辑** —— Partner A 大量"iP15P 128"这种没"GB"后缀的命名,光靠 token 匹配会大量低置信;补 storage-set 兜底 + structural override 后才把 HIGH 占比拉到 86%
 3. **测试数据真实性** —— 自己造的样本太干净测不出 DQ 价值;反复用 Partner B 真实 154 行 NZ 数据迭代规则,得出"DQ → 规则迭代 → replay"闭环这个可演示的故事
 4. **SCD-2 同日观测边界** —— 重放测试时撞到 valid_from > valid_to 的约束失败,加了"同日守卫"
 
-### 6b · 自认为设计得好的部分(3 min)
+### 7b · 自认为设计得好的部分(3 min)
 
 1. **三阶段 DQ + Severity 政策**(独创):INGEST/PRE_FACT/SEMANTIC 各自不同失败策略,让 fact 表 by construction 可信,下游不需过滤视图
 2. **DQ 全 PL/pgSQL**:19 条规则一次 DB 调用,1M 行 90 秒级而非 30 分钟
@@ -515,7 +554,7 @@ score = 0.5 × attr_match + 0.3 × token_jaccard + 0.2 × char_fuzz_ratio
 4. **Visualization payload 解耦**:返回结构化 JSON 而非渲染好的图,前端 / Slack / PDF 多消费者复用
 5. **fact_anomaly 一行一信号**(不合并):支持按 severity 独立路由到不同团队
 
-### 6c · 可继续优化的部分(2 min)
+### 7c · 可继续优化的部分(2 min)
 
 1. **TEMPORAL / CROSS_PARTNER / SKU_VARIANCE 三个 anomaly 信号**:目前只 STATISTICAL 端到端,其他三个 schema 已就位但 detector 待实现
 2. **异步管道 + COPY**:C3 里写了设计,demo 跑同步够用;真上百万行需要补这两块基础设施
