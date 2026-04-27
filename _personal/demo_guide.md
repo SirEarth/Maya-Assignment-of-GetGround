@@ -11,11 +11,12 @@
 |---|---|---:|
 | 1 | 项目背景 + 题目要求 + 我实现了什么 | 3 min |
 | 2 | 整体 App 演示(上传文件 → DB 全表) | 10 min |
-| 3 | 技术架构图 + 业务流程图 | 8 min |
-| 4 | Task B 4 个核心接口详细设计 | 15 min |
-| 5 | C3 百万级扩展方案 | 5 min |
-| 6 | 反思:挑战 / 亮点 / 可优化 | 8 min |
-| 7 | Q&A | 30 min |
+| 3 | 技术架构图 + 业务流程图 | 5 min |
+| 4 | **Task A · 数据库设计**(需求→schema 映射) | 6 min |
+| 5 | Task B 4 个核心接口详细设计 | 15 min |
+| 6 | C3 百万级扩展方案 | 5 min |
+| 7 | 反思:挑战 / 亮点 / 可优化 | 8 min |
+| 8 | Q&A | 30 min |
 
 ---
 
@@ -178,7 +179,7 @@ open "Apple SDE/submission/results_showcase.html"
 
 ---
 
-## §3 技术架构图 + 业务流程图(8 min)
+## §3 技术架构图 + 业务流程图(5 min)
 
 ### 3a · 技术架构图(分层视图)
 
@@ -317,7 +318,77 @@ open "Apple SDE/submission/results_showcase.html"
 
 ---
 
-## §4 Task B 4 个核心接口详细设计(15 min)
+## §4 Task A · 数据库设计(6 min)
+
+**对应:** [`presentation.md`](presentation.md) Slide 7–9。
+
+讲解策略:**先用一张映射表把题目 5 项要求和我们的设计对上号**,再深入两个最有亮点的设计(CTI 和 SCD-2)。
+
+### 4a · 题目要求 → 设计映射(看 Slide 7)
+
+| 题目要求 | 我的设计 | 关键表/概念 |
+|---|---|---|
+| 1. 调和不同 partner 数据格式 | 单一规范化 fact 表 + harmonise 流水线把原始名映射到标准 model | `fact_price_offer` + `dim_product_model` |
+| 2. 多支付方式 **不要 sparse 列** | **Class Table Inheritance(CTI)**:父表 + 1:1 子表分支 | `fact_price_offer` + `fact_payment_full_price` / `fact_payment_instalment` |
+| 3. 标准化 product ID | 双键:SERIAL 代理键(用于 join)+ VARCHAR 自然键(用于幂等) | `dim_product_model.product_model_id` + `model_key` |
+| 4. 时序追踪 | Bi-temporal 事实(business + system 时间)+ **SCD-2** 历史 | `fact_price_offer.{crawl_ts_utc, ingested_at}` + `fact_partner_price_history` |
+| 5. dq_output / bad_records 表 | 三层 DQ 表:catalog 注册 + per-(rule,run) 汇总 + per-failing-row 明细 | `dq_rule_catalog` + `dq_output` + `dq_bad_records` |
+
+**台词:**
+> *"Five requirements, five deliberate design responses. Each row of this table answers 'why this not that'. Class Table Inheritance for payment polymorphism, not sparse columns. SCD-2 for history, not overwrite-in-place. Three-tier DQ tables, not one unified dump. Each choice has a clear cost we accepted to gain a specific property."*
+>
+> **中文备注:** 5 项需求 5 个对应设计;每一项都是有意识的取舍——为什么这样不那样。
+
+**核心数字:** 29 张表 / 4 个 ENUM / 月分区 / A+MV 聚合混合 / 完整精简 schema 在 `submission/task_a_schema.sql`。
+
+### 4b · Star Schema 走一下(看 Slide 8)
+
+打开 [`schema.sql`](../Apple%20SDE/schema.sql) 翻到 SECTION 2,**指着** `fact_price_offer` 的 CTI 父子关系:
+
+```sql
+-- 父表 (CTI 父)
+CREATE TABLE fact_price_offer (
+  payment_type  payment_type_enum NOT NULL,   -- discriminator
+  ...
+);
+
+-- 子表 1
+CREATE TABLE fact_payment_full_price (
+  full_price NUMERIC(12,2) NOT NULL CHECK (full_price > 0),  -- 真 NOT NULL!
+  ...
+);
+
+-- 子表 2
+CREATE TABLE fact_payment_instalment (
+  monthly_amount     NUMERIC(12,2) NOT NULL CHECK (monthly_amount > 0),
+  instalment_months  SMALLINT      NOT NULL CHECK (instalment_months BETWEEN 1 AND 60),
+  ...
+);
+```
+
+**台词:**
+> *"This is the payoff: each child has real NOT NULL + CHECK constraints, not the NULLable columns you'd be forced into with a sparse single-table design. Adding a new payment method like Buy Now Pay Later is `ALTER TYPE` plus one new child table — old data zero impact."*
+>
+> **中文备注:** CTI 的回报:子表的 NOT NULL/CHECK 约束是真的;加新支付类型(BNPL)只是 ALTER TYPE + 加一张子表,老数据零影响。
+
+### 4c · SCD-2 + A+MV 混合(看 Slide 9)
+
+讲 `fact_partner_price_history` 怎么做"压缩历史":
+
+- 价格 1 周变 1 次,每天 4 次爬取 → 360 行原始观测
+- SCD-2 只在价格**真变化**时插一行 → 同期 ~3-5 行
+- **20-50× 压缩比**
+
+**台词:**
+> *"Partner prices change roughly weekly, but partners are scraped 4-12 times per day. Storing every observation is 90% redundant. SCD-2 inserts only on actual change, with valid_from / valid_to date ranges — a compressed history that supports both 'current price' (where valid_to_date IS NULL) and 'price on day X' (range query). That's the data feeding the anomaly detector's 30-day baselines."*
+>
+> **中文备注:** Partner 价格大约一周一变,每天爬 4-12 次 → 90% 冗余;SCD-2 只在真变化时插行,带 valid_from/valid_to 区间。"当前价" + "某日价"两种查询都 O(1)。是 anomaly detection 的 30 天基线数据源。
+
+**A+MV 混合:** mv_baseline_staging(MATERIALIZED VIEW)负责计算 → dws_product_price_baseline_1d(物理表)负责持久化 + 去重。
+
+---
+
+## §5 Task B 4 个核心接口详细设计(15 min)
 
 ### 4a · `GET /harmonise-product`(3 min)
 
@@ -406,9 +477,9 @@ score = 0.5 × attr_match + 0.3 × token_jaccard + 0.2 × char_fuzz_ratio
 
 ---
 
-## §5 C3 百万级扩展方案(5 min)
+## §6 C3 百万级扩展方案(5 min)
 
-**对应 Slide 14 / `submission/task_c_answers.md` C.3。不要 Live Demo,直接走表。**
+**对应 Slide 15 / `submission/task_c_answers.md` C.3。不要 Live Demo,直接走表。**
 
 | # | 改造 | 状态 |
 |---|---|:---:|
@@ -427,7 +498,7 @@ score = 0.5 × attr_match + 0.3 × token_jaccard + 0.2 × char_fuzz_ratio
 
 ---
 
-## §6 反思:挑战 / 亮点 / 可优化(8 min)
+## §7 反思:挑战 / 亮点 / 可优化(8 min)
 
 ### 6a · 主要挑战(3 min)
 
@@ -457,7 +528,7 @@ score = 0.5 × attr_match + 0.3 × token_jaccard + 0.2 × char_fuzz_ratio
 
 ---
 
-## §7 Q&A(30 min)
+## §8 Q&A(30 min)
 
 **应答指南** — 任何"为什么这么设计"问题,直接指对应文件:
 

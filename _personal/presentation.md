@@ -5,17 +5,18 @@
 >
 > Prepared by: huizhongwu
 
-**Slide deck flows in 7 sections matching [`demo_guide.md`](demo_guide.md):**
+**Slide deck flows in 8 sections matching [`demo_guide.md`](demo_guide.md):**
 
 | § | Topic | Slides | Time |
 |---|---|---|---:|
 | 1 | Project context & what I delivered | 1–3 | 3 min |
 | 2 | Live app walkthrough | 4 | 10 min |
-| 3 | Technical architecture & pipeline diagrams | 5–8 | 8 min |
-| 4 | Task B endpoint design deep-dive | 9–13 | 15 min |
-| 5 | Task C-3 scaling to 1 M records | 14 | 5 min |
-| 6 | Reflection — challenges / highlights / next steps | 15–17 | 8 min |
-| 7 | Q&A | 18–20 | 30 min |
+| 3 | Technical architecture & pipeline diagrams | 5–6 | 5 min |
+| 4 | Task A — Database design (requirements → schema mapping) | 7–9 | 6 min |
+| 5 | Task B endpoint design deep-dive | 10–14 | 15 min |
+| 6 | Task C-3 scaling to 1 M records | 15 | 5 min |
+| 7 | Reflection — challenges / highlights / next steps | 16–18 | 8 min |
+| 8 | Q&A | 19–21 | 30 min |
 
 ---
 
@@ -117,7 +118,7 @@ Tech stack: PostgreSQL 14+ • Python 3.9+ • FastAPI • Pydantic 2 • asyncp
 
 ---
 
-# §3 · Technical Architecture & Pipeline Diagrams (8 min)
+# §3 · Technical Architecture & Pipeline Diagrams (5 min)
 
 ---
 
@@ -239,7 +240,44 @@ Tech stack: PostgreSQL 14+ • Python 3.9+ • FastAPI • Pydantic 2 • asyncp
 
 ---
 
-## Slide 7 — Data Model: Star Schema (Kimball)
+# §4 · Task A — Database Design (6 min)
+
+---
+
+## Slide 7 — Task A: Requirements → Design Mapping
+
+The assignment specifies **five requirements** for Task A. Each maps to a deliberate design choice:
+
+| # | Requirement | Design response | Where it lives |
+|---|---|---|---|
+| 1 | Reconcile differences between partner data sources | Single normalised fact table fed by a harmonise pipeline that maps raw partner names to canonical models | `fact_price_offer` + `dim_product_model` |
+| 2 | Multiple payment methods **WITHOUT a sparse table design** | **Class Table Inheritance (CTI)** — parent fact + 1:1 child tables per payment type | `fact_price_offer` + `fact_payment_full_price` / `fact_payment_instalment` |
+| 3 | Standardised product identifiers | Two-tier keying: SERIAL surrogate for joins + VARCHAR natural key for idempotency | `dim_product_model.product_model_id` + `model_key` |
+| 4 | Track temporal data | Bi-temporal facts (business + system time) + **Slowly Changing Dimension Type 2** history table | `fact_price_offer.{crawl_ts_utc, ingested_at}` + `fact_partner_price_history` |
+| 5 | dq_output and bad_records tables | Three DQ tables: rule registry + per-(rule, run) summary + per-failing-record audit | `dq_rule_catalog` + `dq_output` + `dq_bad_records` |
+
+**By the numbers:**
+
+| Tables | 29 | 14 dimensions · 5 facts · 3 DQ · 4 DWS · 3 partition defaults |
+|---|---:|---|
+| ENUM types | 4 | `payment_type_enum` · `harmonise_confidence_enum` · `bad_record_status_enum` · `product_lifecycle_enum` |
+| Partitioning | RANGE by month | on `crawl_ts_utc` for `fact_price_offer` and its CTI children |
+| Aggregation | A+MV hybrid | materialised view feeding the baseline summary table |
+
+**Why these particular choices and not the obvious alternatives?**
+
+| Alternative | Why we rejected it |
+|---|---|
+| Sparse columns for payment | Wastes storage, prevents NOT NULL / CHECK constraints on payment-specific fields, explicitly forbidden by the brief |
+| JSONB for payment payload | Database can't enforce schema on `payment_details` JSONB; loses SQL type safety; index path queries are awkward |
+| SCD-1 (overwrite-in-place) | Loses history — anomaly detection's 30-day rolling baselines would have nothing to read |
+| One unified DQ table (no catalog / output split) | Aggregate dashboards (per-rule pass rate trend) become slow joins; per-record audit explodes the table; we want both grains |
+
+The next two slides expand the two highest-leverage choices: **Star Schema** (Slide 8) and **SCD-2 + Aggregate Hybrid** (Slide 9). The full clean schema for submission lives in `submission/task_a_schema.sql` (758 lines).
+
+---
+
+## Slide 8 — Data Model: Star Schema (Kimball)
 
 ```
               ┌──────────────────┐
@@ -280,7 +318,7 @@ Tech stack: PostgreSQL 14+ • Python 3.9+ • FastAPI • Pydantic 2 • asyncp
 
 ---
 
-## Slide 8 — Compressed Price History + Aggregation (SCD-2 + A+MV)
+## Slide 9 — Compressed Price History + Aggregation (SCD-2 + A+MV)
 
 **Slowly Changing Dimension Type 2** — `fact_partner_price_history` only inserts a new row when the price actually changes:
 
@@ -313,11 +351,11 @@ POST /detect-anomalies
 
 ---
 
-# §4 · Task B Endpoint Design (15 min)
+# §5 · Task B Endpoint Design (15 min)
 
 ---
 
-## Slide 9 — API Surface
+## Slide 10 — API Surface
 
 | Endpoint | Method | Purpose | Implementation |
 |----------|--------|---------|----------------|
@@ -336,7 +374,7 @@ POST /detect-anomalies
 
 ---
 
-## Slide 10 — `GET /harmonise-product`
+## Slide 11 — `GET /harmonise-product`
 
 **Problem:** Map raw partner names to canonical product models.
 - `iP 17 PM 512GB` → `iPhone 17 Pro Max 512GB` (HIGH 0.946)
@@ -361,7 +399,7 @@ score = 0.5 × attribute_match    (structured: category, storage, chip, model)
 
 ---
 
-## Slide 11 — `POST /load-data`
+## Slide 12 — `POST /load-data`
 
 **The 8-step pipeline (see Slide 6 diagram).** This is the centrepiece — five design calls worth highlighting:
 
@@ -379,7 +417,7 @@ score = 0.5 × attribute_match    (structured: category, storage, chip, model)
 
 ---
 
-## Slide 12 — `POST /compute-dq` (DQ 3-Stage Strategy)
+## Slide 13 — `POST /compute-dq` (DQ 3-Stage Strategy)
 
 **13 rules, three stages — each stage with a different policy:**
 
@@ -404,7 +442,7 @@ NEW  →  IN_REVIEW  →  RESOLVED (replay batch) | IGNORED
 
 ---
 
-## Slide 13 — `POST /detect-anomalies`
+## Slide 14 — `POST /detect-anomalies`
 
 **Four anomaly types — each detected independently:**
 
@@ -437,11 +475,11 @@ Same payload feeds Chart.js, Slack cards, PDF reports — frontend does the draw
 
 ---
 
-# §5 · Task C-3 — Scaling to 1 Million Records (5 min)
+# §6 · Task C-3 — Scaling to 1 Million Records (5 min)
 
 ---
 
-## Slide 14 — Scaling to 1 M Records
+## Slide 15 — Scaling to 1 M Records
 
 **Current sync flow:** 3–7 hours for 1 M rows; HTTP times out long before completion.
 
@@ -467,11 +505,11 @@ See [`task_c_answers.md`](../Apple%20SDE/submission/task_c_answers.md) C.3 for f
 
 ---
 
-# §6 · Reflection (8 min)
+# §7 · Reflection (8 min)
 
 ---
 
-## Slide 15 — Challenges & Iterations
+## Slide 16 — Challenges & Iterations
 
 **Things that turned out harder than expected:**
 
@@ -491,7 +529,7 @@ See [`task_c_answers.md`](../Apple%20SDE/submission/task_c_answers.md) C.3 for f
 
 ---
 
-## Slide 16 — Design Highlights I'm Proud Of
+## Slide 17 — Design Highlights I'm Proud Of
 
 **1. Three-stage DQ with severity-driven policy.** The architectural call I'd defend in any review:
    - INGEST stops at staging (parse errors)
@@ -519,7 +557,7 @@ See [`task_c_answers.md`](../Apple%20SDE/submission/task_c_answers.md) C.3 for f
 
 ---
 
-## Slide 17 — What I'd Build Differently
+## Slide 18 — What I'd Build Differently
 
 **1. Three remaining anomaly signals.** TEMPORAL / CROSS_PARTNER / SKU_VARIANCE — schemas and response shapes are in place; their detector branches are scoped as future work. The visualization helper is signal-agnostic and reusable.
 
@@ -535,11 +573,11 @@ See [`task_c_answers.md`](../Apple%20SDE/submission/task_c_answers.md) C.3 for f
 
 ---
 
-# §7 · Q&A (30 min)
+# §8 · Q&A (30 min)
 
 ---
 
-## Slide 18 — Q&A Cheat Sheet
+## Slide 19 — Q&A Cheat Sheet
 
 **Likely deep-dive questions and where the answer lives:**
 
@@ -561,7 +599,7 @@ See [`task_c_answers.md`](../Apple%20SDE/submission/task_c_answers.md) C.3 for f
 
 ---
 
-## Slide 19 — Technical Glossary
+## Slide 20 — Technical Glossary
 
 ### Q1 — How does a country value flow through the pipeline?
 
@@ -606,7 +644,7 @@ In the demo we keep ingest synchronous within the request handler. Production de
 
 ---
 
-## Slide 20 — Closing
+## Slide 21 — Closing
 
 **Three takeaways:**
 
