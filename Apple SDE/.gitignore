@@ -1,0 +1,42 @@
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ─── Pytest / coverage ───
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ─── Virtual environments ───
+.venv/
+venv/
+env/
+ENV/
+
+# ─── IDE / editor ───
+.vscode/
+.idea/
+.dbclient/
+*.swp
+*.swo
+*~
+
+# ─── OS ───
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Build / dist (if ever published as a package) ───
+build/
+dist/
+*.egg-info/
+
+# ─── Local environment / secrets ───
+.env
+.env.local
+*.local
