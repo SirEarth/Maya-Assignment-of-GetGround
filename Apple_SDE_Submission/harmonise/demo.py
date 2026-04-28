@@ -2,11 +2,7 @@
 Demo script — runs the harmoniser against sample queries drawn from
 Partner A / Partner B CSVs.
 
-Run from project root:
-    python -m harmonise.demo
-
-Or from the Apple SDE directory:
-    cd "Apple SDE"
+Run from the project folder (the one containing this README + start.sh):
     python -m harmonise.demo
 """
 
@@ -46,12 +42,11 @@ SAMPLE_QUERIES = [
 
 
 def main() -> None:
-    # Resolve Product Ref.csv — works whether CWD is repo root or Apple SDE/
+    # Resolve Product Ref.csv — works regardless of CWD
     here      = Path(__file__).resolve().parent
     candidates = [
-        here.parent / "Product Ref.csv",         # when run from Apple SDE/
-        Path.cwd()  / "Apple SDE" / "Product Ref.csv",   # from repo root
-        Path.cwd()  / "Product Ref.csv",
+        here.parent / "Product Ref.csv",         # next to harmonise/ (the project folder)
+        Path.cwd()  / "Product Ref.csv",         # current directory
     ]
     ref_path = next((p for p in candidates if p.exists()), None)
     if ref_path is None:

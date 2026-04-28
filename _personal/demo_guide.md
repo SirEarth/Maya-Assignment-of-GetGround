@@ -23,46 +23,34 @@
 ## 飞行前检查(开始前 15 分钟)
 
 ```bash
-# 1. Postgres + 三阶段规则齐全
-psql -d maya_assignment -c "SELECT target_stage, COUNT(*) FROM dq_rule_catalog GROUP BY 1 ORDER BY 1;"
+cd Apple_SDE_Submission
+
+# 1. 一键重置 + 启动(reset 干净 → schema → seed → 测试 → 起服务 → 开浏览器)
+./start.sh reset
+# 期望: 44 passed · API ready on http://localhost:8000
+
+# 2. Postgres + 三阶段规则齐全(已被 seed 处理,这里是确认查询)
+PSQL=/Applications/Postgres.app/Contents/Versions/latest/bin/psql
+$PSQL -d maya_assignment -c "SELECT target_stage, COUNT(*) FROM dq_rule_catalog GROUP BY 1 ORDER BY 1;"
 # 期望: INGEST=8, PRE_FACT=3, SEMANTIC=2(共 13 条)
 
-# 2. 测试全绿
-cd "Apple SDE" && python3 -m pytest -q
-# 期望: 39 passed
+# 3. 灌一次 baseline 数据(start.sh reset 完只有 seed,fact 是空)
+curl -s -X POST http://localhost:8000/pipeline -F "file=@Partner A.csv" -F "partner_code=PARTNER_A" > /dev/null
+curl -s -X POST http://localhost:8000/pipeline -F "file=@Partner B.csv" -F "partner_code=PARTNER_B" > /dev/null
 ```
 
-**3. 重置 DB 到干净 baseline**(强烈推荐 — 让现场数字和 [`results_showcase.html`](../Apple%20SDE/submission/results_showcase.html) 对得上)
+**预期 baseline 行数(harmoniser 改进后):** stg 4 208 / fact 4 174 / history 119 / dq_bad_records ~77 / dq_output 26(2 batches × 13 rules)
 
-```bash
-PSQL=/Applications/Postgres.app/Contents/Versions/latest/bin/psql
+> ⚠️ Demo 中如果手抖多次上传同一个 partner,fact / stg / dws 会**累积**,只有 `fact_partner_price_history` 因 SCD-2 同日守卫不会变。要快速回 0 用 `./start.sh wipe`(~0.5 秒,保留 seed)。
 
-# 清空所有事实/staging/DQ 数据(维度表不动)
-$PSQL -d maya_assignment <<'SQL'
-TRUNCATE TABLE
-  fact_payment_full_price, fact_payment_instalment, fact_price_offer,
-  fact_partner_price_history, stg_price_offer, dq_bad_records, dq_output,
-  dws_partner_dq_per_batch
-RESTART IDENTITY CASCADE;
-SQL
+**Tab 配置(VSCode 主屏 + 浏览器):**
 
-# 重新加载 Partner A + B 各一次
-curl -X POST http://localhost:8000/load-data -F "file=@Partner A.csv" -F "partner_code=PARTNER_A"
-curl -X POST http://localhost:8000/load-data -F "file=@Partner B.csv" -F "partner_code=PARTNER_B"
-```
-
-**预期 baseline 行数:** stg 4 208 / fact 4 174 / history 119 / dq_bad_records 188 / dq_output 26(2 batches × 13 rules)
-
-> ⚠️ Demo 中如果手抖多次上传 Partner A 或 B,大部分表会**累积**(stg / fact / dq_*),只有 `fact_partner_price_history` 因 SCD-2 同日守卫不会变。`results_showcase.html` 是静态快照不受影响,但 VSCode 里的全表 COUNT 会变大 —— 演讲前 reset 一次就稳了。
-
-**Tab 配置(2 终端 + VSCode 数据库面板):**
-
-| 位置 | 用途 | 启动命令 |
+| 位置 | 用途 | 启动 / 命令 |
 |---|---|---|
-| **Terminal Tab ①** | uvicorn(全程不动) | `lsof -ti:8000 \| xargs kill 2>/dev/null; python3 -m uvicorn api.main:app --port 8000` |
-| **Terminal Tab ②** | 备用 shell(跑 pytest / 临时命令 / 翻车应急) | `cd "Apple SDE"`(等用) |
-| **VSCode 数据库面板** | 实时查 DB | 打开 [`demo_queries.sql`](demo_queries.sql) 选段执行 |
-| **浏览器** | Swagger UI | `http://localhost:8000/docs` |
+| **VSCode 数据库面板** | 实时查 DB(drill-down 用) | 打开 [`demo_queries.sql`](demo_queries.sql) 选段执行 |
+| **浏览器 Tab 1** | 看板 | [`pipeline_runner.html`](../Apple_SDE_Submission/submission/pipeline_runner.html)(start.sh 自动开) |
+| **浏览器 Tab 2** | Swagger UI | `http://localhost:8000/docs` |
+| **Terminal**(可选) | 应急 wipe / reset | `cd Apple_SDE_Submission`,要清干净跑 `./start.sh wipe` |
 
 **VSCode Database Client 连接:** `localhost / 5432 / whoami / 留空 / maya_assignment`
 
@@ -81,7 +69,7 @@ curl -X POST http://localhost:8000/load-data -F "file=@Partner B.csv" -F "partne
 
 **我交付了什么(一口气快速过):**
 - ✅ Task A — 29 张表,Class Table Inheritance + Slowly Changing Dimension Type 2 + 三层 DQ 表
-- ✅ Task B — 4 个接口全部实现,真 PostgreSQL 后端,**39/39 测试通过**
+- ✅ Task B — 4 个接口 + orchestrator 全部实现,真 PostgreSQL 后端,**44/44 测试通过**
 - ✅ Task C — 三个短答都在 `submission/task_c_answers.md` 里
 - 加分项:DQ 三阶段(INGEST + PRE_FACT gate + SEMANTIC),解决了"fact 表是否可信"的根本问题
 
@@ -125,7 +113,7 @@ GET  /health                          ← Liveness probe
 
 1. 点击 **`POST /pipeline`** 展开
 2. 点右上角 **"Try it out"** 进入交互模式
-3. **`file`** 字段 → 选 `Apple SDE/Partner A.csv`
+3. **`file`** 字段 → 选 `Apple_SDE_Submission/Partner A.csv`
 4. **`partner_code`** 填 `PARTNER_A`
 5. 点蓝色 **"Execute"**
 
@@ -176,17 +164,17 @@ GET  /health                          ← Liveness probe
 >
 > **中文备注:** Path B 三步分调 = Task B 字面要求;关键对比是 fact 表"事后标记"vs Path A 的"硬 gate"。NZ 154 行是 DQ → 规则迭代 → replay 闭环的真实例子。
 
-### 2d · 切到浏览器,打开 [`results_showcase.html`](../Apple%20SDE/submission/results_showcase.html) 走 **7 张可视化卡片**
+### 2d · 切到浏览器,打开 [`results_showcase.html`](../Apple_SDE_Submission/submission/results_showcase.html) 走 **7 张可视化卡片**
 
 ```bash
-open "Apple SDE/submission/results_showcase.html"
+open "Apple_SDE_Submission/submission/results_showcase.html"
 ```
 
 按顺序滚动讲(每张图大约 30–60 秒):
 
 | 区块 | 你要讲什么 |
 |---|---|
-| **Headline** 4 个数字大卡 | "4 174 fact rows / 90% HIGH harmonise / 9 blocked / 188 violations —— 一行能看完整体" |
+| **Headline** 4 个数字大卡 | "4 174 fact rows / 90% HIGH harmonise / 9 blocked / 77 violations —— 一行能看完整体" |
 | **① Pipeline Funnel** | stg 4208 → fact 4174,中间 PRE_FACT gate 挡掉 9 行(下面琥珀色框讲那 9 行全是 Apple Watch SKU,Reference 没收录) |
 | **② Harmonise Confidence Distribution** | 90% HIGH —— 算法在脏数据上的真实命中率 |
 | **③ DQ Pass-Rate by Rule** | 13 条规则 10 条 100% 通过,3 条触发(DQ_HARM_001 / DQ_HARM_002 / DQ_PRICE_001) |
@@ -374,7 +362,7 @@ open "Apple SDE/submission/results_showcase.html"
 
 ### 4b · Star Schema 走一下(看 Slide 8)
 
-打开 [`schema.sql`](../Apple%20SDE/schema.sql) 翻到 SECTION 2,**指着** `fact_price_offer` 的 CTI 父子关系:
+打开 [`schema.sql`](../Apple_SDE_Submission/schema.sql) 翻到 SECTION 2,**指着** `fact_price_offer` 的 CTI 父子关系:
 
 ```sql
 -- 父表 (CTI 父)
@@ -423,7 +411,7 @@ CREATE TABLE fact_payment_instalment (
 
 ### 5a · `GET /harmonise-product`(3 min)
 
-**指代码:** [`harmonise/`](../Apple%20SDE/harmonise/) 6 个模块。
+**指代码:** [`harmonise/`](../Apple_SDE_Submission/harmonise/) 6 个模块。
 
 **核心算法:** 三信号加权评分
 ```
@@ -445,7 +433,7 @@ score = 0.5 × attr_match + 0.3 × token_jaccard + 0.2 × char_fuzz_ratio
 
 ### 5b · `POST /pipeline` + `POST /load-data` 对比(5 min · 重头戏)
 
-**指代码:** [`api/services.py:984`](../Apple%20SDE/api/services.py#L984) `run_pipeline` 朗读 docstring;[`api/services.py:780`](../Apple%20SDE/api/services.py#L780) `submit_load_job` 对比。
+**指代码:** [`api/services.py:985`](../Apple_SDE_Submission/api/services.py#L985) `run_pipeline` 朗读 docstring;[`api/services.py:781`](../Apple_SDE_Submission/api/services.py#L781) `submit_load_job` 对比。
 
 **核心架构决策(在 §3 已画过图,这里强调"为什么是这两个端点"):**
 
@@ -459,7 +447,7 @@ score = 0.5 × attr_match + 0.3 × token_jaccard + 0.2 × char_fuzz_ratio
 
 ### 5c · `POST /compute-dq`(3 min)
 
-**指代码:** [`api/services.py:853`](../Apple%20SDE/api/services.py#L853) `compute_dq_service`;[`dq/rules.sql`](../Apple%20SDE/dq/rules.sql)(13 条 PL/pgSQL 函数)+ [`dq/rules_split.sql`](../Apple%20SDE/dq/rules_split.sql)(3 个 stage 编排器)。
+**指代码:** [`api/services.py:854`](../Apple_SDE_Submission/api/services.py#L854) `compute_dq_service`;[`dq/rules.sql`](../Apple_SDE_Submission/dq/rules.sql)(13 条 PL/pgSQL 函数)+ [`dq/rules_split.sql`](../Apple_SDE_Submission/dq/rules_split.sql)(3 个 stage 编排器)。
 
 **Task B 字面要求:** 检查 DQ + 写 `dq_output` + 写 `dq_bad_records`。**已实现且仅做这件事**——request body 只接 `source_batch_id`,内部按 INGEST/PRE_FACT/SEMANTIC 顺序跑全部 13 条,然后聚合返回。
 
@@ -483,7 +471,7 @@ score = 0.5 × attr_match + 0.3 × token_jaccard + 0.2 × char_fuzz_ratio
 
 ### 5d · `POST /detect-anomalies`(4 min)
 
-**指代码:** [`api/services.py:691`](../Apple%20SDE/api/services.py#L691) `detect_anomalies` + `_build_anomaly_visualization`。
+**指代码:** [`api/services.py:944`](../Apple_SDE_Submission/api/services.py#L944) `detect_anomalies_service`;helper 在 [`api/services.py:517`](../Apple_SDE_Submission/api/services.py#L517) `detect_anomalies_for_batch` + [`api/services.py:702`](../Apple_SDE_Submission/api/services.py#L702) `_build_anomaly_visualization`。
 
 **4 信号设计** + **每信号独立分类**:
 
@@ -582,7 +570,7 @@ Tier 1 (自动)        Tier 2 (业务)              Tier 3 (学习)
 ### 7b · 自认为设计得好的部分(3 min)
 
 1. **三阶段 DQ + Severity 政策**(独创):INGEST/PRE_FACT/SEMANTIC 各自不同失败策略,让 fact 表 by construction 可信,下游不需过滤视图
-2. **DQ 全 PL/pgSQL**:19 条规则一次 DB 调用,1M 行 90 秒级而非 30 分钟
+2. **DQ 全 PL/pgSQL**:13 条规则一次 DB 调用,1M 行 90 秒级而非 30 分钟
 3. **可解释的 harmonise**:三信号 breakdown + 结构化 override,业务审核能看懂为什么是这个匹配
 4. **Visualization payload 解耦**:返回结构化 JSON 而非渲染好的图,前端 / Slack / PDF 多消费者复用
 5. **fact_anomaly 一行一信号**(不合并):支持按 severity 独立路由到不同团队
@@ -624,23 +612,28 @@ Tier 1 (自动)        Tier 2 (业务)              Tier 3 (学习)
 ## 附录 A · 基线状态重置(出乱子时用)
 
 ```bash
-dropdb maya_assignment 2>/dev/null && createdb maya_assignment
-cd "Apple SDE"
-psql -d maya_assignment -f schema.sql -f dq/rules.sql -f dq/rules_split.sql
-python3 seed_bootstrap.py
-# 用 Path A `/pipeline` 一键灌两个 partner(干净 fact,gate 生效)
+cd Apple_SDE_Submission
+
+# 完全 nuke 重来(drop DB → schema → seed → 测试 → 起服务,~10s)
+./start.sh reset
+
+# 只清事务表(保留 seed + 服务进程,~0.5s)
+./start.sh wipe
+
+# 然后用 Path A 一键灌两个 partner(干净 fact,gate 生效)
 curl -X POST http://localhost:8000/pipeline -F "file=@Partner A.csv" -F "partner_code=PARTNER_A"
 curl -X POST http://localhost:8000/pipeline -F "file=@Partner B.csv" -F "partner_code=PARTNER_B"
 ```
 
-**预期行数:** stg ~4208 / fact ~4174 / history 119 / bad_records ~188 / dq_output 26(Path A 跑完后)。
+**预期行数(harmoniser 改进后):** stg ~4208 / fact ~4174 / history 119 / bad_records ~77 / dq_output 26(Path A 跑完后)。
 
 ## 附录 B · 翻车应急
 
 | 现象 | 修法 |
 |---|---|
-| 服务崩 | Tab ① `Ctrl+C` → 重启 uvicorn |
-| `Errno 48 address already in use` | `lsof -ti:8000 \| xargs kill` |
-| Ingest 500 | 看 `/tmp/uvicorn.log`;多半是 DB 约束抓脏数据,讲成 feature |
+| 服务崩 | `./start.sh stop && ./start.sh` |
+| `Errno 48 address already in use` | `./start.sh stop` 或 `lsof -ti:8000 \| xargs kill` |
+| Ingest 500 | `tail -f .uvicorn.log`;多半是 DB 约束抓脏数据,讲成 feature |
 | Swagger 空白 | `Cmd+Shift+R` 强刷 |
-| 时间不够 | 跳 §4d 异常注入,直接讲文档里 visualization 字段定义 |
+| 数据脏了想清干净 | `./start.sh wipe` 立即清 fact/stg/dq,seed 不动 |
+| 时间不够 | 跳 §5d 异常注入,直接讲文档里 visualization 字段定义 |

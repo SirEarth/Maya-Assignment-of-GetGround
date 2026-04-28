@@ -30,12 +30,13 @@ from uuid import UUID
 from fastapi import (
     FastAPI, File, Form, HTTPException, Path, Query, UploadFile, status,
 )
+from fastapi.middleware.cors import CORSMiddleware
 
 from . import services
 from .db import close_pool, init_pool
 from .models import (
     BadRecordList, BadRecordStatus, ComputeDQRequest, ComputeDQResponse,
-    Confidence, DetectAnomaliesRequest, DetectAnomaliesResponse,
+    Confidence, DashboardStats, DetectAnomaliesRequest, DetectAnomaliesResponse,
     ErrorResponse, HarmoniseResponse, LoadDataAcceptedResponse, LoadJobStatus,
     PipelineResponse, ResolveBadRecordRequest, ResolveBadRecordResponse,
     Severity,
@@ -72,11 +73,38 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS — permissive for the local-disk HTML demo (submission/pipeline_runner.html
+# opened via file://). Tighten allow_origins for any real deployment.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/health", tags=["meta"], summary="Liveness probe")
 def health():
     """Standard liveness probe for container-orchestration platforms."""
     return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get(
+    "/dashboard-stats",
+    tags=["meta"],
+    response_model=DashboardStats,
+    summary="DB-wide aggregate stats for the live visualization dashboard",
+    description=(
+        "Cross-batch totals + harmonise distribution + per-rule pass rates "
+        "+ pipeline funnel + recent bad-record samples. Reads across ALL "
+        "batches currently in the database — not scoped to a single "
+        "source_batch_id. Powers `submission/pipeline_runner.html` and "
+        "refreshes whenever the frontend polls this endpoint."
+    ),
+)
+async def dashboard_stats():
+    return await services.get_dashboard_stats()
 
 
 # ===========================================================================

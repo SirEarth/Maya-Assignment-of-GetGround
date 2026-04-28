@@ -35,13 +35,14 @@ from fastapi import HTTPException
 
 from .db import get_pool
 from .models import (
-    AnomaliesBySeverity, Anomaly, AnomalyContext, AnomalyType,
-    AnomalyVisualization, BadRecordEntry, BadRecordStatus, BaselineSnapshot,
-    Confidence, DQRuleRunResult, DQSummary, DQViolationsBySeverity,
-    DetectAnomaliesRequest, DetectAnomaliesResponse, HarmoniseMatch,
-    HarmoniseResponse, JobStatus, LoadDataAcceptedResponse, LoadDataProgress,
-    LoadJobStatus, PipelineResponse, ResolveAction, Severity, SignalBreakdown,
-    TimeSeriesPoint,
+    AnomaliesBySeverity, Anomaly, AnomalyContext, AnomalyDashboardStats,
+    AnomalyType, AnomalyVisualization, BadRecordEntry, BadRecordStatus,
+    BaselineSnapshot, Confidence, DashboardStats, DashboardTotals,
+    DQRulePassRate, DQRuleRunResult, DQSummary, DQViolationsBySeverity,
+    DetectAnomaliesRequest, DetectAnomaliesResponse, FunnelStats,
+    HarmoniseMatch, HarmoniseResponse, HarmoniseSample, JobStatus,
+    LoadDataAcceptedResponse, LoadDataProgress, LoadJobStatus, PipelineResponse,
+    ResolveAction, Severity, SignalBreakdown, TimeSeriesPoint,
 )
 
 
@@ -231,6 +232,49 @@ async def run_ingest_dq(conn: asyncpg.Connection, batch_id: uuid.UUID) -> None:
 
 # ---------- Step 3: harmonise rows in stg ----------
 
+# Keys we never want in the harmonise search text:
+#   - __row_num: internal bookkeeping
+#   - PRODUCT_NAME_VAL: already passed in via raw_product_name (avoids double weight)
+#   - CRAWL_TS, COUNTRY_VAL, PARTNER: metadata, not product attributes
+#   - FULL PRICE / MONTHLY_INSTALMENT_AMT / INSTALMENT_MONTH: numeric, already structured
+_HARMONISE_PAYLOAD_EXCLUDE = frozenset({
+    "__row_num", "PRODUCT_NAME_VAL", "CRAWL_TS",
+    "COUNTRY_VAL", "PARTNER",
+    "FULL PRICE", "MONTHLY_INSTALMENT_AMT", "INSTALMENT_MONTH",
+})
+
+
+def _build_harmonise_query(raw_product_name: str, raw_payload) -> str:
+    """Concatenate raw_product_name + any extra string-typed raw_payload values
+    so partner-specific attribute columns (e.g. CONNECTIVITY=WiFi) flow into
+    the harmoniser. Numeric fields and known metadata keys are excluded.
+    asyncpg returns jsonb as a JSON string, so we parse defensively.
+    """
+    if isinstance(raw_payload, str):
+        try:
+            payload = json.loads(raw_payload)
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+    elif isinstance(raw_payload, dict):
+        payload = raw_payload
+    else:
+        payload = {}
+
+    extras = []
+    for key, value in payload.items():
+        if key in _HARMONISE_PAYLOAD_EXCLUDE:
+            continue
+        if not isinstance(value, str):
+            continue
+        v = value.strip()
+        if v:
+            extras.append(v)
+
+    if not extras:
+        return raw_product_name
+    return f"{raw_product_name} {' '.join(extras)}"
+
+
 async def harmonise_in_stg(conn: asyncpg.Connection, batch_id: uuid.UUID) -> Tuple[int, int, int]:
     """Run the Harmoniser on each row; write product_model_id back to stg.
 
@@ -239,13 +283,23 @@ async def harmonise_in_stg(conn: asyncpg.Connection, batch_id: uuid.UUID) -> Tup
     (without prior DQ) both harmonise the whole batch. Path A's INGEST-failing
     rows are still harmonised (negligible cost, prevents missing matches when
     a row fails INGEST for an unrelated reason like NULL crawl_ts).
+
+    Search text is raw_product_name PLUS any other non-numeric string fields
+    in raw_payload (excluding the already-structured columns we map elsewhere
+    and partner/country/timestamp metadata). This lets the harmoniser pick up
+    attribute hints — connectivity (WiFi/Cellular), storage, color — that a
+    partner may carry in a separate column instead of embedding in the product
+    name. For Partners A and B as currently shaped this is a no-op (Partner A
+    has no extra text columns; Partner B already embeds connectivity in
+    PRODUCT_NAME_VAL), but it lights up cleanly for any partner that splits
+    attributes into their own columns.
     Returns (high, medium, low) confidence counts.
     """
     h = get_harmoniser()
 
     stg_rows = await conn.fetch(
         """
-        SELECT stg_row_id, raw_product_name
+        SELECT stg_row_id, raw_product_name, raw_payload
         FROM stg_price_offer
         WHERE source_batch_id = $1
           AND raw_product_name IS NOT NULL
@@ -262,7 +316,8 @@ async def harmonise_in_stg(conn: asyncpg.Connection, batch_id: uuid.UUID) -> Tup
     high, medium, low = 0, 0, 0
     updates = []
     for row in stg_rows:
-        matches = h.match(row["raw_product_name"], k=1)
+        query_text = _build_harmonise_query(row["raw_product_name"], row["raw_payload"])
+        matches = h.match(query_text, k=1)
         if not matches:
             updates.append((row["stg_row_id"], None, None, None))
             continue
@@ -513,18 +568,62 @@ async def update_scd2(conn: asyncpg.Connection, batch_id: uuid.UUID) -> None:
 
 # ---------- Step 8: detect anomalies for a batch ----------
 
+SEV_RANK = {Severity.HIGH: 3, Severity.MEDIUM: 2, Severity.LOW: 1}
+
+# Severity threshold tiers (relative-deviation signals: STATISTICAL, TEMPORAL,
+# CROSS_PARTNER). Hardcoded for the demo; production reads from
+# `dim_anomaly_threshold` and snapshots them per fact_anomaly row.
+SEV_BAR_LOW    = 0.10
+SEV_BAR_MEDIUM = 0.15
+SEV_BAR_HIGH   = 0.25
+
+# SKU_VARIANCE uses absolute z-score thresholds (different math)
+SKU_Z_LOW    = 1.5
+SKU_Z_MEDIUM = 2.5
+SKU_Z_HIGH   = 4.0
+
+
+def _severity_from_pct(pct: float) -> Severity:
+    """Map a relative deviation to severity using the standard tier."""
+    if pct >= SEV_BAR_HIGH:   return Severity.HIGH
+    if pct >= SEV_BAR_MEDIUM: return Severity.MEDIUM
+    return Severity.LOW
+
+
+def _severity_from_zscore(z: float) -> Severity:
+    if z >= SKU_Z_HIGH:   return Severity.HIGH
+    if z >= SKU_Z_MEDIUM: return Severity.MEDIUM
+    return Severity.LOW
+
+
 async def detect_anomalies_for_batch(
     conn: asyncpg.Connection,
     batch_id: uuid.UUID,
     min_severity: Severity = Severity.LOW,
     product_model_ids: Optional[List[int]] = None,
 ) -> List[Anomaly]:
-    """Detect pricing anomalies on the fact rows belonging to this batch.
+    """Run all 4 anomaly signals on the fact rows belonging to this batch
+    and persist the union to `fact_anomaly`.
 
-    For each offer in scope, compares its USD price against the 30-day rolling
-    mean from fact_partner_price_history. Builds a visualization payload
-    (time series + baseline band + cross-partner comparison) for each anomaly
-    so the frontend can render it directly.
+    Signal taxonomy (independent classification per signal — same offer that
+    trips two signals = two `fact_anomaly` rows, each with own severity):
+
+    1. STATISTICAL    — vs 30-day rolling baseline from Slowly Changing
+                        Dimension Type 2 history. Catches "this is unusual
+                        for THIS product right now."
+    2. TEMPORAL       — vs the immediate previous price for the same
+                        (product, partner, country, payment_type).
+                        Catches sudden jumps that the rolling mean smooths.
+    3. CROSS_PARTNER  — vs other partners' current price for the same
+                        (product, country, payment_type). Catches
+                        single-partner pricing errors / data feed bugs.
+    4. SKU_VARIANCE   — within-batch variance across observations of the
+                        same product on the same crawl date. Catches
+                        per-row typos (Space Grey iPad standalone outlier).
+
+    Each detector runs in its own helper and returns an independent list;
+    the main function concatenates them, persists to fact_anomaly (idempotent
+    via UNIQUE(offer_id, anomaly_type)), and returns the union.
     """
     offers = await conn.fetch(
         """
@@ -542,16 +641,37 @@ async def detect_anomalies_for_batch(
         product_model_ids,
     )
 
-    anomalies: List[Anomaly] = []
-    sev_rank = {Severity.HIGH: 3, Severity.MEDIUM: 2, Severity.LOW: 1}
+    if not offers:
+        return []
 
+    anomalies: List[Anomaly] = []
+    anomalies.extend(await _detect_statistical(conn, offers, min_severity))
+    anomalies.extend(await _detect_temporal(conn, offers, min_severity))
+    anomalies.extend(await _detect_cross_partner(conn, offers, min_severity))
+    anomalies.extend(await _detect_sku_variance(conn, offers, min_severity))
+
+    if anomalies:
+        await _persist_anomalies_to_fact(conn, anomalies, batch_id)
+    return anomalies
+
+
+# ---------- Detector 1: STATISTICAL (vs 30-day rolling baseline) ----------
+
+async def _detect_statistical(
+    conn: asyncpg.Connection,
+    offers: List[asyncpg.Record],
+    min_severity: Severity,
+) -> List[Anomaly]:
+    """For each offer: compare vs AVG/STDDEV from fact_partner_price_history
+    over the last 30 days. Skip if baseline has < 2 samples or deviation < 10%.
+    """
+    anomalies: List[Anomaly] = []
     for o in offers:
         stat = await conn.fetchrow(
             """
-            SELECT
-              AVG(effective_total_usd)    AS mean_usd,
-              STDDEV(effective_total_usd) AS std_usd,
-              COUNT(*)                    AS n
+            SELECT AVG(effective_total_usd)    AS mean_usd,
+                   STDDEV(effective_total_usd) AS std_usd,
+                   COUNT(*)                    AS n
             FROM fact_partner_price_history
             WHERE product_model_id = $1
               AND country_code     = $2
@@ -563,16 +683,12 @@ async def detect_anomalies_for_batch(
             continue
         mean_usd = float(stat["mean_usd"])
         std_usd  = float(stat["std_usd"] or 0.0)
-        obs = float(o["effective_total_usd"])
-        pct_off = abs(obs - mean_usd) / mean_usd if mean_usd else 0.0
-        if pct_off < 0.10:
+        obs      = float(o["effective_total_usd"])
+        pct_off  = abs(obs - mean_usd) / mean_usd if mean_usd else 0.0
+        if pct_off < SEV_BAR_LOW:
             continue
-
-        severity = (Severity.HIGH if pct_off >= 0.25
-                    else Severity.MEDIUM if pct_off >= 0.15
-                    else Severity.LOW)
-
-        if sev_rank[severity] < sev_rank[min_severity]:
+        severity = _severity_from_pct(pct_off)
+        if SEV_RANK[severity] < SEV_RANK[min_severity]:
             continue
 
         visualization = await _build_anomaly_visualization(
@@ -586,7 +702,6 @@ async def detect_anomalies_for_batch(
             mean_usd         = mean_usd,
             std_usd          = std_usd,
         )
-
         anomalies.append(Anomaly(
             anomaly_id          = o["offer_id"],
             offer_id            = o["offer_id"],
@@ -598,7 +713,7 @@ async def detect_anomalies_for_batch(
             partner_code        = o["partner_code"],
             country_code        = o["country_code"],
             observed_price_usd  = round(obs, 2),
-            explanation         = f"{pct_off*100:.1f}% deviation from 30-day mean (${mean_usd:.2f})",
+            explanation         = f"{pct_off*100:.1f}% deviation from 30-day mean (${mean_usd:,.2f})",
             context = AnomalyContext(
                 lifecycle_status    = "STABLE",
                 lifecycle_factor    = 1.0,
@@ -611,9 +726,445 @@ async def detect_anomalies_for_batch(
                 ),
             ),
             visualization = visualization,
-            detected_at = _now_utc(),
+            detected_at   = _now_utc(),
         ))
     return anomalies
+
+
+# ---------- Detector 2: TEMPORAL (vs immediate previous price) ----------
+
+async def _detect_temporal(
+    conn: asyncpg.Connection,
+    offers: List[asyncpg.Record],
+    min_severity: Severity,
+) -> List[Anomaly]:
+    """For each offer: compare to the immediately previous price for the same
+    (product, partner, country, payment_type) tuple in Slowly Changing
+    Dimension Type 2 history. Catches sudden price jumps that the rolling
+    mean smooths over.
+
+    'Previous price' = the most recent valid_to_date < current_obs_date row
+    (or the open `valid_to_date IS NULL` row when this is a re-observation).
+    """
+    anomalies: List[Anomaly] = []
+    for o in offers:
+        prev = await conn.fetchrow(
+            """
+            SELECT effective_total_usd AS last_usd, valid_from_date
+            FROM fact_partner_price_history
+            WHERE product_model_id = $1
+              AND partner_id       = $2
+              AND country_code     = $3
+              AND payment_type     = $4::payment_type_enum
+              AND valid_from_date  < $5::date
+            ORDER BY valid_from_date DESC
+            LIMIT 1
+            """,
+            o["product_model_id"], o["partner_id"], o["country_code"],
+            o["payment_type"], o["crawl_ts_utc"],
+        )
+        if not prev or not prev["last_usd"]:
+            continue
+        last  = float(prev["last_usd"])
+        obs   = float(o["effective_total_usd"])
+        if last == 0:
+            continue
+        pct_off = abs(obs - last) / last
+        if pct_off < SEV_BAR_LOW:
+            continue
+        severity = _severity_from_pct(pct_off)
+        if SEV_RANK[severity] < SEV_RANK[min_severity]:
+            continue
+
+        anomalies.append(Anomaly(
+            anomaly_id          = o["offer_id"],
+            offer_id            = o["offer_id"],
+            anomaly_type        = AnomalyType.TEMPORAL,
+            severity            = severity,
+            signal_score        = round(min(pct_off, 1.0), 3),
+            product_model_id    = o["product_model_id"],
+            product_model_name  = o["model_key"] or "<unknown>",
+            partner_code        = o["partner_code"],
+            country_code        = o["country_code"],
+            observed_price_usd  = round(obs, 2),
+            explanation         = (
+                f"{pct_off*100:.1f}% jump from last valid price "
+                f"(${last:,.2f} on {prev['valid_from_date']})"
+            ),
+            context = AnomalyContext(
+                lifecycle_status    = "STABLE",
+                lifecycle_factor    = 1.0,
+                suppression_applied = False,
+                baseline_snapshot   = BaselineSnapshot(
+                    window_days = 0,    # TEMPORAL = single previous point, not a window
+                    sample_size = 1,
+                    mean        = round(last, 2),
+                    stddev      = 0.0,
+                ),
+            ),
+            visualization = None,   # TEMPORAL is point-to-point, no time-series payload
+            detected_at   = _now_utc(),
+        ))
+    return anomalies
+
+
+# ---------- Detector 3: CROSS_PARTNER (vs peer partners' median) ----------
+
+async def _detect_cross_partner(
+    conn: asyncpg.Connection,
+    offers: List[asyncpg.Record],
+    min_severity: Severity,
+) -> List[Anomaly]:
+    """For each offer: compare against the median price reported by OTHER
+    partners for the same (product, country, payment_type). Reads from
+    v_partner_price_current.partner_prices_json which already aggregates
+    {partner_code: usd} across the live market snapshot.
+
+    Skip if there's only one partner reporting (no peer to compare to).
+    """
+    anomalies: List[Anomaly] = []
+    for o in offers:
+        view_row = await conn.fetchrow(
+            """
+            SELECT partner_prices_json, partner_count
+            FROM v_partner_price_current
+            WHERE product_model_id = $1
+              AND country_code     = $2
+              AND payment_type     = $3::payment_type_enum
+            """,
+            o["product_model_id"], o["country_code"], o["payment_type"],
+        )
+        if not view_row or not view_row["partner_prices_json"]:
+            continue
+        if int(view_row["partner_count"] or 0) < 2:
+            continue   # need ≥ 2 partners to have peers
+
+        peer_json = view_row["partner_prices_json"]
+        if isinstance(peer_json, str):
+            peer_json = json.loads(peer_json)
+        # Exclude self
+        peer_prices = [
+            float(v) for k, v in peer_json.items()
+            if k != o["partner_code"] and v is not None
+        ]
+        if not peer_prices:
+            continue
+
+        peer_prices.sort()
+        n = len(peer_prices)
+        peer_median = (
+            peer_prices[n // 2] if n % 2 == 1
+            else (peer_prices[n // 2 - 1] + peer_prices[n // 2]) / 2.0
+        )
+
+        obs = float(o["effective_total_usd"])
+        if peer_median == 0:
+            continue
+        pct_off = abs(obs - peer_median) / peer_median
+        if pct_off < SEV_BAR_LOW:
+            continue
+        severity = _severity_from_pct(pct_off)
+        if SEV_RANK[severity] < SEV_RANK[min_severity]:
+            continue
+
+        anomalies.append(Anomaly(
+            anomaly_id          = o["offer_id"],
+            offer_id            = o["offer_id"],
+            anomaly_type        = AnomalyType.CROSS_PARTNER,
+            severity            = severity,
+            signal_score        = round(min(pct_off, 1.0), 3),
+            product_model_id    = o["product_model_id"],
+            product_model_name  = o["model_key"] or "<unknown>",
+            partner_code        = o["partner_code"],
+            country_code        = o["country_code"],
+            observed_price_usd  = round(obs, 2),
+            explanation         = (
+                f"{pct_off*100:.1f}% off the {len(peer_prices)}-peer median "
+                f"(${peer_median:,.2f}); peers: " +
+                ", ".join(f"{k}=${float(v):,.0f}"
+                          for k, v in peer_json.items() if k != o["partner_code"])
+            ),
+            context = AnomalyContext(
+                lifecycle_status    = "STABLE",
+                lifecycle_factor    = 1.0,
+                suppression_applied = False,
+                baseline_snapshot   = BaselineSnapshot(
+                    window_days = 0,    # snapshot, not a time window
+                    sample_size = len(peer_prices),
+                    mean        = round(peer_median, 2),
+                    stddev      = 0.0,
+                ),
+            ),
+            visualization = None,
+            detected_at   = _now_utc(),
+        ))
+    return anomalies
+
+
+# ---------- Detector 4: SKU_VARIANCE (within-batch outlier) ----------
+
+async def _detect_sku_variance(
+    conn: asyncpg.Connection,
+    offers: List[asyncpg.Record],
+    min_severity: Severity,
+) -> List[Anomaly]:
+    """For each (product_model_id, partner_id, country_code, payment_type,
+    crawl_date) group of 3+ observations within the batch: compute mean+std
+    and flag rows whose price is > 1.5σ from the group mean as anomalies.
+
+    Catches per-SKU typos like Partner B's Space Grey iPad ($146,340 USD
+    while other colors of the same model are ~$1,400). The other colors
+    pin the mean tight, the typo blows out as a high z-score.
+
+    Note: this works at the model+date granularity (multi-color SKUs with
+    same model_key collapse into one group). True per-SKU resolution would
+    require fact_price_offer to carry sku_id (a future schema enhancement).
+    """
+    if len(offers) < 3:
+        return []
+
+    # Group offers by (model, partner, country, payment_type, crawl_date)
+    groups: Dict[tuple, List[asyncpg.Record]] = {}
+    for o in offers:
+        key = (
+            o["product_model_id"], o["partner_id"], o["country_code"],
+            o["payment_type"], o["crawl_ts_utc"].date(),
+        )
+        groups.setdefault(key, []).append(o)
+
+    anomalies: List[Anomaly] = []
+    for key, group in groups.items():
+        if len(group) < 3:
+            continue   # need ≥ 3 for variance to be meaningful
+        prices = [float(g["effective_total_usd"]) for g in group]
+        n_g    = len(prices)
+        mean_g = sum(prices) / n_g
+        var_g  = sum((p - mean_g) ** 2 for p in prices) / (n_g - 1)
+        std_g  = var_g ** 0.5
+        if std_g == 0:
+            continue   # all prices identical, no outlier possible
+
+        for o in group:
+            obs = float(o["effective_total_usd"])
+            z   = abs(obs - mean_g) / std_g
+            if z < SKU_Z_LOW:
+                continue
+            severity = _severity_from_zscore(z)
+            if SEV_RANK[severity] < SEV_RANK[min_severity]:
+                continue
+
+            anomalies.append(Anomaly(
+                anomaly_id          = o["offer_id"],
+                offer_id            = o["offer_id"],
+                anomaly_type        = AnomalyType.SKU_VARIANCE,
+                severity            = severity,
+                signal_score        = round(min(z / 10.0, 1.0), 3),
+                product_model_id    = o["product_model_id"],
+                product_model_name  = o["model_key"] or "<unknown>",
+                partner_code        = o["partner_code"],
+                country_code        = o["country_code"],
+                observed_price_usd  = round(obs, 2),
+                explanation         = (
+                    f"{z:.1f}σ outlier within {n_g}-observation same-model "
+                    f"group (mean ${mean_g:,.2f}, σ ${std_g:,.2f})"
+                ),
+                context = AnomalyContext(
+                    lifecycle_status    = "STABLE",
+                    lifecycle_factor    = 1.0,
+                    suppression_applied = False,
+                    baseline_snapshot   = BaselineSnapshot(
+                        window_days = 0,   # within-batch snapshot, not time window
+                        sample_size = n_g,
+                        mean        = round(mean_g, 2),
+                        stddev      = round(std_g, 2),
+                    ),
+                ),
+                visualization = None,
+                detected_at   = _now_utc(),
+            ))
+    return anomalies
+
+
+async def _persist_anomalies_to_fact(
+    conn: asyncpg.Connection,
+    anomalies: List[Anomaly],
+    batch_id: uuid.UUID,
+) -> None:
+    """UPSERT anomalies into fact_anomaly. Each (offer_id, anomaly_type) pair
+    is unique — replaying detection on the same batch UPDATEs the row's
+    severity/score/snapshot rather than inserting a duplicate."""
+    if not anomalies:
+        return
+
+    # Look up crawl_ts_utc + partner_id once per offer (fact_anomaly stores
+    # them denormalized for fast filtering without a join)
+    offer_ids = list({a.offer_id for a in anomalies})
+    meta_rows = await conn.fetch(
+        """
+        SELECT offer_id, crawl_ts_utc, partner_id
+        FROM fact_price_offer
+        WHERE offer_id = ANY($1::bigint[])
+        """,
+        offer_ids,
+    )
+    offer_meta = {r["offer_id"]: (r["crawl_ts_utc"], r["partner_id"]) for r in meta_rows}
+
+    # Frozen threshold snapshot — what `dim_anomaly_threshold` looked like at
+    # detection time. Stored per row so replays remain explainable even if
+    # thresholds drift.
+    threshold_snap = json.dumps({
+        "severity_bar_high":          0.25,
+        "severity_bar_medium":        0.15,
+        "severity_bar_low":           0.10,
+        "signal_weight_statistical":  1.0,
+        "min_baseline_samples":       2,
+        "baseline_window_days":       30,
+    })
+
+    rows: List[tuple] = []
+    for a in anomalies:
+        meta = offer_meta.get(a.offer_id)
+        if not meta:
+            continue   # offer was deleted between detect + persist; skip
+        crawl_ts, partner_id = meta
+
+        baseline_snap = None
+        if a.context.baseline_snapshot is not None:
+            bs = a.context.baseline_snapshot
+            baseline_snap = json.dumps({
+                "mean":        bs.mean,
+                "stddev":      bs.stddev,
+                "p05":         bs.p05,
+                "p50":         bs.p50,
+                "p95":         bs.p95,
+                "sample_size": bs.sample_size,
+                "window_days": bs.window_days,
+            })
+
+        rows.append((
+            a.offer_id, crawl_ts, batch_id,
+            a.product_model_id, partner_id, a.country_code,
+            a.anomaly_type.value, float(a.signal_score), a.severity.value,
+            a.context.lifecycle_factor, a.context.event_suppression_factor, None,
+            float(a.observed_price_usd),
+            baseline_snap, threshold_snap,
+            a.context.suppression_applied, a.context.suppression_event_id,
+        ))
+
+    await conn.executemany(
+        """
+        INSERT INTO fact_anomaly (
+            offer_id, crawl_ts_utc, source_batch_id,
+            product_model_id, partner_id, country_code,
+            anomaly_type, signal_score, severity,
+            lifecycle_factor, event_suppression_factor, category_sensitivity,
+            observed_price_usd, baseline_snapshot, threshold_snapshot,
+            suppression_applied, suppression_event_id
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+            $13, $14::jsonb, $15::jsonb, $16, $17
+        )
+        ON CONFLICT (offer_id, anomaly_type) DO UPDATE SET
+            severity                  = EXCLUDED.severity,
+            signal_score              = EXCLUDED.signal_score,
+            lifecycle_factor          = EXCLUDED.lifecycle_factor,
+            event_suppression_factor  = EXCLUDED.event_suppression_factor,
+            observed_price_usd        = EXCLUDED.observed_price_usd,
+            baseline_snapshot         = EXCLUDED.baseline_snapshot,
+            threshold_snapshot        = EXCLUDED.threshold_snapshot,
+            suppression_applied       = EXCLUDED.suppression_applied,
+            suppression_event_id      = EXCLUDED.suppression_event_id,
+            source_batch_id           = EXCLUDED.source_batch_id,
+            crawl_ts_utc              = EXCLUDED.crawl_ts_utc,
+            detected_at               = NOW(),
+            -- preserve workflow fields (status / assignee / resolution_notes)
+            -- across re-detections — those are business-set
+            status                    = fact_anomaly.status
+        """,
+        rows,
+    )
+
+
+def _anomaly_from_fact_row(r: asyncpg.Record) -> Anomaly:
+    """Re-hydrate an Anomaly Pydantic object from one fact_anomaly row + its
+    joined dim_partner / dim_product_model labels. Used by the dashboard read
+    path so we don't re-run detection just to render counts."""
+    bs = r["baseline_snapshot"]
+    if isinstance(bs, str):
+        bs = json.loads(bs)
+    baseline = None
+    if bs:
+        baseline = BaselineSnapshot(
+            window_days = int(bs.get("window_days", 30)),
+            sample_size = int(bs.get("sample_size", 0)),
+            mean        = float(bs.get("mean") or 0.0),
+            stddev      = bs.get("stddev"),
+            p05         = bs.get("p05"),
+            p50         = bs.get("p50"),
+            p95         = bs.get("p95"),
+        )
+
+    obs = float(r["observed_price_usd"]) if r["observed_price_usd"] is not None else 0.0
+    mean = baseline.mean if baseline else obs
+    pct_off = (abs(obs - mean) / mean) if mean else 0.0
+    sig_score = float(r["signal_score"])
+    a_type = r["anomaly_type"]
+
+    # Type-aware explanation — each detector has different baseline semantics.
+    # Reading from fact_anomaly we don't have the original explanation text
+    # (it isn't a stored column), so we re-derive from anomaly_type +
+    # baseline_snapshot fields.
+    if a_type == "STATISTICAL":
+        explanation = (
+            f"{pct_off * 100:.1f}% deviation from {baseline.window_days}-day rolling mean "
+            f"(${mean:,.2f}, n={baseline.sample_size})"
+            if baseline and mean else f"STATISTICAL signal · score {sig_score:.3f}"
+        )
+    elif a_type == "TEMPORAL":
+        explanation = (
+            f"{pct_off * 100:.1f}% jump from previous price (${mean:,.2f})"
+            if baseline and mean else f"TEMPORAL signal · score {sig_score:.3f}"
+        )
+    elif a_type == "CROSS_PARTNER":
+        explanation = (
+            f"{pct_off * 100:.1f}% off the {baseline.sample_size}-peer median "
+            f"(${mean:,.2f})"
+            if baseline and mean else f"CROSS_PARTNER signal · score {sig_score:.3f}"
+        )
+    elif a_type == "SKU_VARIANCE":
+        # signal_score = z/10 by construction → recover z
+        z = sig_score * 10
+        explanation = (
+            f"{z:.1f}σ outlier within {baseline.sample_size}-observation same-model group "
+            f"(group mean ${mean:,.2f}, σ ${baseline.stddev or 0:,.2f})"
+            if baseline else f"SKU_VARIANCE signal · score {sig_score:.3f}"
+        )
+    else:
+        explanation = f"{a_type} signal · score {sig_score:.3f}"
+
+    return Anomaly(
+        anomaly_id          = int(r["anomaly_id"]),
+        offer_id            = int(r["offer_id"]),
+        anomaly_type        = AnomalyType(r["anomaly_type"]),
+        severity            = Severity(r["severity"]),
+        signal_score        = float(r["signal_score"]),
+        product_model_id    = int(r["product_model_id"]),
+        product_model_name  = r["model_key"] or "<unknown>",
+        partner_code        = r["partner_code"],
+        country_code        = r["country_code"],
+        observed_price_usd  = round(obs, 2),
+        explanation         = explanation,
+        context = AnomalyContext(
+            lifecycle_status         = "STABLE",
+            lifecycle_factor         = float(r["lifecycle_factor"] or 1.0),
+            event_suppression_factor = float(r["event_suppression_factor"] or 1.0),
+            suppression_applied      = bool(r["suppression_applied"]),
+            suppression_event_id     = r["suppression_event_id"],
+            baseline_snapshot        = baseline,
+        ),
+        visualization = None,  # built on-demand for the chart sample only
+        detected_at   = r["detected_at"],
+    )
 
 
 # ---------- Step 9: write batch summary ----------
@@ -1041,6 +1592,37 @@ async def run_pipeline(file_bytes: bytes, partner_code: str) -> PipelineResponse
             by_severity      = dq_by_sev,
         )
 
+        # Per-stage failed-record counts (for the frontend's per-step view)
+        stage_rows = await conn.fetch(
+            """
+            SELECT c.target_stage AS stage, SUM(o.failed_records) AS fail
+            FROM dq_output o
+            JOIN dq_rule_catalog c ON c.rule_id = o.rule_id
+            WHERE o.source_batch_id = $1
+            GROUP BY c.target_stage
+            """,
+            batch_id,
+        )
+        dq_by_stage: Dict[str, int] = {"INGEST": 0, "PRE_FACT": 0, "SEMANTIC": 0}
+        for r in stage_rows:
+            dq_by_stage[r["stage"]] = int(r["fail"] or 0)
+
+        # Counters for the frontend's "table changes per step" view
+        rows_stg = (await conn.fetchrow(
+            "SELECT COUNT(*) AS n FROM stg_price_offer WHERE source_batch_id = $1",
+            batch_id,
+        ))["n"] or 0
+        rows_history = (await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS n FROM fact_partner_price_history
+            WHERE (product_model_id, partner_id, country_code, payment_type) IN (
+                SELECT DISTINCT product_model_id, partner_id, country_code, payment_type
+                FROM fact_price_offer WHERE source_batch_id = $1
+            )
+            """,
+            batch_id,
+        ))["n"] or 0
+
     completed_at = _now_utc()
     by_sev = AnomaliesBySeverity()
     for a in anomalies:
@@ -1054,10 +1636,13 @@ async def run_pipeline(file_bytes: bytes, partner_code: str) -> PipelineResponse
         partner_code      = partner_code,
         started_at        = started_at,
         completed_at      = completed_at,
+        rows_stg          = rows_stg,
         rows_loaded       = rows_loaded,
         rows_unchanged    = rows_unchanged,
         rows_bad          = rows_bad,
+        rows_history      = rows_history,
         dq_summary        = dq_summary,
+        dq_by_stage       = dq_by_stage,
         anomalies_total   = len(anomalies),
         anomalies_by_severity = by_sev,
     )
@@ -1149,3 +1734,570 @@ async def resolve_bad_record(
             raise HTTPException(404, f"bad_record_id {bad_record_id} not found")
 
     return new_status, resolved_at, replay_batch
+
+
+# ===========================================================================
+# /dashboard-stats — DB-wide aggregate snapshot for the live UI
+# ===========================================================================
+
+async def get_dashboard_stats(sample_bad_limit: int = 12) -> DashboardStats:
+    """DB-wide aggregate stats — totals, harmonise distribution, DQ pass rates,
+    funnel, dedicated lists for PRE_FACT-blocked + LOW-confidence harmonise,
+    a stratified harmonise-sample set with full signal breakdown, and an
+    anomaly visualization. Powers submission/pipeline_runner.html.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        # ----- Totals -----
+        rows_stg     = (await conn.fetchrow("SELECT COUNT(*) AS n FROM stg_price_offer"))["n"]
+        rows_fact    = (await conn.fetchrow("SELECT COUNT(*) AS n FROM fact_price_offer"))["n"]
+        rows_history = (await conn.fetchrow("SELECT COUNT(*) AS n FROM fact_partner_price_history"))["n"]
+        rows_bad     = (await conn.fetchrow("SELECT COUNT(*) AS n FROM dq_bad_records"))["n"]
+        batches      = (await conn.fetchrow("SELECT COUNT(*) AS n FROM dws_partner_dq_per_batch"))["n"]
+        rules_active = (await conn.fetchrow("SELECT COUNT(*) AS n FROM dq_rule_catalog WHERE is_active"))["n"]
+
+        # Distinct rows blocked at PRE_FACT — a row failing multiple PRE_FACT rules counts once
+        blocked = (await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS n FROM (
+              SELECT DISTINCT b.source_batch_id, (b.raw_payload->>'__row_num')::bigint AS row_num
+              FROM dq_bad_records b
+              JOIN dq_rule_catalog c ON c.rule_id = b.rule_id
+              WHERE c.target_stage = 'PRE_FACT'
+            ) x
+            """
+        ))["n"]
+
+        # ----- Harmonise confidence distribution -----
+        harm_rows = await conn.fetch(
+            """
+            SELECT harmonise_confidence::text AS conf, COUNT(*) AS n
+            FROM fact_price_offer
+            WHERE harmonise_confidence IS NOT NULL
+            GROUP BY harmonise_confidence
+            """
+        )
+        harmonise = {"HIGH": 0, "MEDIUM": 0, "LOW": 0, "MANUAL": 0}
+        for r in harm_rows:
+            if r["conf"] in harmonise:
+                harmonise[r["conf"]] = int(r["n"])
+        harm_total = sum(harmonise.values())
+        harm_high_pct = (harmonise["HIGH"] / harm_total) if harm_total > 0 else 0.0
+
+        # ----- DQ violations by severity (DB-wide) -----
+        sev_rows = await conn.fetch(
+            "SELECT severity::text AS sev, COUNT(*) AS n FROM dq_bad_records GROUP BY severity"
+        )
+        by_sev = DQViolationsBySeverity()
+        for r in sev_rows:
+            s = (r["sev"] or "MEDIUM").upper()
+            n = int(r["n"])
+            if   s == "HIGH":   by_sev.HIGH   += n
+            elif s == "LOW":    by_sev.LOW    += n
+            else:               by_sev.MEDIUM += n
+
+        # ----- DQ violations by stage -----
+        stage_rows = await conn.fetch(
+            """
+            SELECT c.target_stage AS stage, COUNT(*) AS n
+            FROM dq_bad_records b
+            JOIN dq_rule_catalog c ON c.rule_id = b.rule_id
+            GROUP BY c.target_stage
+            """
+        )
+        by_stage = {"INGEST": 0, "PRE_FACT": 0, "SEMANTIC": 0}
+        for r in stage_rows:
+            by_stage[r["stage"]] = int(r["n"])
+
+        # ----- Per-rule pass rates aggregated across all batches -----
+        pr_rows = await conn.fetch(
+            """
+            SELECT
+              c.rule_id, c.rule_name, c.rule_category, c.severity::text AS severity,
+              c.target_stage, c.description,
+              COALESCE(SUM(o.total_records), 0)  AS total,
+              COALESCE(SUM(o.failed_records), 0) AS failed
+            FROM dq_rule_catalog c
+            LEFT JOIN dq_output o ON o.rule_id = c.rule_id
+            WHERE c.is_active
+            GROUP BY c.rule_id, c.rule_name, c.rule_category, c.severity, c.target_stage, c.description
+            ORDER BY
+              CASE c.target_stage WHEN 'INGEST' THEN 1 WHEN 'PRE_FACT' THEN 2 ELSE 3 END,
+              c.rule_id
+            """
+        )
+        pass_rates = []
+        for r in pr_rows:
+            total  = int(r["total"]  or 0)
+            failed = int(r["failed"] or 0)
+            pr     = (1.0 - failed / total) if total > 0 else 1.0
+            pass_rates.append(DQRulePassRate(
+                rule_id        = r["rule_id"],
+                rule_name      = r["rule_name"],
+                rule_category  = r["rule_category"] or "general",
+                severity       = Severity(r["severity"] or "MEDIUM"),
+                target_stage   = r["target_stage"],
+                description    = r["description"],
+                total_records  = total,
+                failed_records = failed,
+                pass_rate      = round(pr, 4),
+            ))
+
+        # ----- Funnel -----
+        ingest_passed   = (await conn.fetchrow(
+            "SELECT COUNT(*) AS n FROM stg_price_offer WHERE dq_status IN ('INGEST_PASSED','PRE_FACT_PASSED')"
+        ))["n"]
+        after_harmonise = (await conn.fetchrow(
+            "SELECT COUNT(*) AS n FROM stg_price_offer WHERE product_model_id IS NOT NULL"
+        ))["n"]
+        prefact_passed  = (await conn.fetchrow(
+            "SELECT COUNT(*) AS n FROM stg_price_offer WHERE dq_status = 'PRE_FACT_PASSED'"
+        ))["n"]
+        funnel = FunnelStats(
+            stg             = rows_stg,
+            ingest_passed   = ingest_passed,
+            after_harmonise = after_harmonise,
+            prefact_passed  = prefact_passed,
+            fact            = rows_fact,
+            history         = rows_history,
+        )
+
+        def _row_to_bad_entry(r: asyncpg.Record, target_stage: Optional[str] = None) -> BadRecordEntry:
+            return BadRecordEntry(
+                bad_record_id   = r["bad_record_id"],
+                source_batch_id = r["source_batch_id"],
+                rule_id         = r["rule_id"],
+                target_stage    = target_stage if target_stage is not None else r.get("target_stage"),
+                failed_field    = r["failed_field"],
+                error_message   = r["error_message"],
+                severity        = Severity(r["severity"] or "MEDIUM"),
+                status          = BadRecordStatus(r["status"]),
+                assignee        = r["assignee"],
+                raw_payload     = json.loads(r["raw_payload"]) if isinstance(r["raw_payload"], str) else r["raw_payload"],
+                detected_at     = r["detected_at"],
+                resolved_at     = r["resolved_at"],
+            )
+
+        # ----- Recent bad records (any rule) — keeps a small sample -----
+        bad_rows = await conn.fetch(
+            f"""
+            SELECT b.bad_record_id, b.source_batch_id, b.rule_id, c.target_stage,
+                   b.failed_field, b.error_message, b.severity, b.status::text AS status,
+                   b.assignee, b.raw_payload, b.detected_at, b.resolved_at
+            FROM dq_bad_records b
+            JOIN dq_rule_catalog c ON c.rule_id = b.rule_id
+            ORDER BY b.detected_at DESC
+            LIMIT {int(sample_bad_limit)}
+            """
+        )
+        sample_bad = [_row_to_bad_entry(r) for r in bad_rows]
+
+        # ----- Full distinct list of PRE_FACT-blocked rows -----
+        # A row that fails multiple PRE_FACT rules appears once (DISTINCT ON
+        # the (batch_id, row_num) tuple, keeping the first detected occurrence).
+        prefact_rows = await conn.fetch(
+            """
+            SELECT DISTINCT ON (b.source_batch_id, (b.raw_payload->>'__row_num')::bigint)
+                   b.bad_record_id, b.source_batch_id, b.rule_id, c.target_stage,
+                   b.failed_field, b.error_message, b.severity, b.status::text AS status,
+                   b.assignee, b.raw_payload, b.detected_at, b.resolved_at
+            FROM dq_bad_records b
+            JOIN dq_rule_catalog c ON c.rule_id = b.rule_id
+            WHERE c.target_stage = 'PRE_FACT'
+            ORDER BY b.source_batch_id, (b.raw_payload->>'__row_num')::bigint, b.detected_at
+            """
+        )
+        prefact_blocked = [_row_to_bad_entry(r) for r in prefact_rows]
+
+        # ----- Full LOW-confidence harmonise list (DQ_HARM_001) -----
+        low_conf_rows = await conn.fetch(
+            """
+            SELECT b.bad_record_id, b.source_batch_id, b.rule_id, c.target_stage,
+                   b.failed_field, b.error_message, b.severity, b.status::text AS status,
+                   b.assignee, b.raw_payload, b.detected_at, b.resolved_at
+            FROM dq_bad_records b
+            JOIN dq_rule_catalog c ON c.rule_id = b.rule_id
+            WHERE b.rule_id = 'DQ_HARM_001'
+            ORDER BY b.detected_at DESC
+            """
+        )
+        low_conf_harmonise = [_row_to_bad_entry(r) for r in low_conf_rows]
+
+        # ----- Harmonise samples (stratified by confidence) with full signal breakdown -----
+        harmonise_samples = await _build_harmonise_samples(conn)
+
+        # ----- Anomaly stats — run detection on the most recent batch -----
+        anomaly_stats = await _build_anomaly_dashboard(conn)
+
+        return DashboardStats(
+            snapshot_at               = _now_utc(),
+            totals = DashboardTotals(
+                rows_stg                = rows_stg,
+                rows_fact               = rows_fact,
+                rows_history            = rows_history,
+                rows_bad                = rows_bad,
+                rows_blocked_by_prefact = blocked,
+                harmonise_high_pct      = round(harm_high_pct, 4),
+                total_violations        = rows_bad,
+                batches_loaded          = batches,
+                rules_in_catalog        = rules_active,
+            ),
+            harmonise_confidence              = harmonise,
+            dq_violations_by_severity         = by_sev,
+            dq_violations_by_stage            = by_stage,
+            dq_pass_rates                     = pass_rates,
+            funnel                            = funnel,
+            sample_bad_records                = sample_bad,
+            prefact_blocked_records           = prefact_blocked,
+            low_confidence_harmonise_records  = low_conf_harmonise,
+            harmonise_samples                 = harmonise_samples,
+            anomaly_stats                     = anomaly_stats,
+        )
+
+
+async def _build_harmonise_samples(conn: asyncpg.Connection) -> List[HarmoniseSample]:
+    """Pick representative raw_product_name values from fact (1 HIGH-top, 1
+    HIGH-verbose, 1 MEDIUM, 1 LOW) and re-score each via the in-process
+    harmoniser to surface the per-signal breakdown the showcase shows."""
+    samples_meta: List[Tuple[str, str]] = []  # (raw_product_name, note)
+
+    # Top-scoring HIGH (typically a clean abbreviation that hit attr_match override)
+    top_high = await conn.fetchrow(
+        """
+        SELECT raw_product_name
+        FROM fact_price_offer
+        WHERE harmonise_confidence = 'HIGH'
+        ORDER BY harmonise_score DESC, LENGTH(raw_product_name) ASC
+        LIMIT 1
+        """
+    )
+    if top_high:
+        samples_meta.append((top_high["raw_product_name"], "Top score in DB · structural override likely fired"))
+
+    # Long verbose HIGH (illustrates 'verbose-but-correct' robustness)
+    verbose_high = await conn.fetchrow(
+        """
+        SELECT raw_product_name
+        FROM fact_price_offer
+        WHERE harmonise_confidence = 'HIGH'
+          AND LENGTH(raw_product_name) >= 60
+        ORDER BY LENGTH(raw_product_name) DESC
+        LIMIT 1
+        """
+    )
+    if verbose_high and (not samples_meta or verbose_high["raw_product_name"] != samples_meta[0][0]):
+        samples_meta.append((verbose_high["raw_product_name"], "Verbose partner string · attribute match dominates over token noise"))
+
+    # MEDIUM
+    medium = await conn.fetchrow(
+        """
+        SELECT raw_product_name
+        FROM fact_price_offer
+        WHERE harmonise_confidence = 'MEDIUM'
+        ORDER BY harmonise_score DESC
+        LIMIT 1
+        """
+    )
+    if medium:
+        samples_meta.append((medium["raw_product_name"], "Medium confidence · partial signal overlap, manual review optional"))
+
+    # LOW (drives the SEMANTIC flagging path — exactly what's in dq_bad_records)
+    low = await conn.fetchrow(
+        """
+        SELECT raw_product_name
+        FROM fact_price_offer
+        WHERE harmonise_confidence = 'LOW'
+        ORDER BY harmonise_score ASC
+        LIMIT 1
+        """
+    )
+    if low:
+        samples_meta.append((low["raw_product_name"], "Low confidence · flagged via DQ_HARM_001 (SEMANTIC stage)"))
+
+    if not samples_meta:
+        return []
+
+    # Re-score via the in-process harmoniser for the full SignalBreakdown
+    h = get_harmoniser()
+    samples: List[HarmoniseSample] = []
+    for raw, note in samples_meta:
+        matches = h.match(raw, k=1)
+        if not matches:
+            continue
+        m = matches[0]
+        samples.append(HarmoniseSample(
+            raw_product_name = raw,
+            canonical_name   = m.canonical_name,
+            model_key        = m.model_key,
+            sku_ids          = m.sku_ids,
+            score            = round(m.score, 3),
+            confidence       = Confidence(m.confidence),
+            signal_breakdown = SignalBreakdown(
+                attr_match      = m.breakdown.attr_match,
+                token_jaccard   = m.breakdown.token_jaccard,
+                char_fuzz       = m.breakdown.char_fuzz,
+                attr_matched    = m.breakdown.attr_matches_on,
+                attr_mismatched = m.breakdown.attr_mismatches,
+            ),
+            note             = note,
+        ))
+    return samples
+
+
+async def _build_anomaly_dashboard(conn: asyncpg.Connection) -> AnomalyDashboardStats:
+    """Read persisted anomalies from `fact_anomaly` (no re-detection) and
+    aggregate stats for the dashboard.
+
+       1. SELECT recent N rows from fact_anomaly (last 30 days), sorted by
+          severity DESC, signal_score DESC — fact_anomaly is the source of
+          truth. detect_anomalies_for_batch wrote them at ingest time.
+       2. Aggregate by_severity + by_type, build top-N table.
+       3. Pick a chart anomaly: prefer the absolute top if it's STATISTICAL
+          (only signal whose payload is a 30-day time-series); otherwise the
+          highest-ranked STATISTICAL anomaly in the recent window so the Live
+          Sample card never goes empty. If no STATISTICAL anomaly exists,
+          render a baseline-only illustration via
+          `_build_baseline_only_visualization`. The caption notes whichever
+          fallback was used.
+       4. If 0 anomalies → same baseline-only fallback (helper shared).
+
+    DQ rule violations are NOT merged into this anomaly stream — they have
+    their own review path in dq_bad_records and the Task C-2 closure loop.
+    """
+    RECENT_ANOMALY_TABLE_LIMIT = 20
+    LOOKBACK_DAYS = 30
+
+    fact_rows = await conn.fetch(
+        f"""
+        SELECT
+          a.anomaly_id, a.offer_id, a.anomaly_type, a.signal_score, a.severity,
+          a.observed_price_usd, a.lifecycle_factor, a.event_suppression_factor,
+          a.suppression_applied, a.suppression_event_id,
+          a.baseline_snapshot, a.threshold_snapshot, a.detected_at,
+          a.country_code, a.product_model_id,
+          p.partner_code,
+          m.model_key
+        FROM fact_anomaly a
+        JOIN dim_partner       p ON p.partner_id       = a.partner_id
+        JOIN dim_product_model m ON m.product_model_id = a.product_model_id
+        WHERE a.detected_at >= NOW() - INTERVAL '{LOOKBACK_DAYS} days'
+        ORDER BY
+          CASE a.severity
+            WHEN 'HIGH' THEN 3
+            WHEN 'MEDIUM' THEN 2
+            ELSE 1
+          END DESC,
+          a.signal_score DESC,
+          a.detected_at DESC
+        LIMIT {RECENT_ANOMALY_TABLE_LIMIT * 5}
+        """
+    )
+
+    anomalies: List[Anomaly] = [_anomaly_from_fact_row(r) for r in fact_rows]
+
+    by_sev = AnomaliesBySeverity()
+    by_type: Dict[str, int] = {}
+    for a in anomalies:
+        if a.severity == Severity.HIGH:     by_sev.HIGH   += 1
+        elif a.severity == Severity.MEDIUM: by_sev.MEDIUM += 1
+        else:                                by_sev.LOW    += 1
+        by_type[a.anomaly_type.value] = by_type.get(a.anomaly_type.value, 0) + 1
+
+    recent_top = anomalies[:RECENT_ANOMALY_TABLE_LIMIT]
+
+    if anomalies:
+        top = recent_top[0]
+        # The time-series chart only renders cleanly for STATISTICAL — that
+        # signal's payload (30-day series + ±1σ band) is what
+        # `_build_anomaly_visualization` produces. TEMPORAL/CROSS_PARTNER/
+        # SKU_VARIANCE are point-in-time comparisons and don't map to a 30-day
+        # line chart. To avoid an empty Live Sample, we use the top STATISTICAL
+        # anomaly's chart when the absolute top isn't STATISTICAL, and fall
+        # back to a baseline-only chart from the richest history group when no
+        # STATISTICAL anomaly exists at all.
+        chart_anomaly = top if top.anomaly_type == AnomalyType.STATISTICAL else next(
+            (a for a in anomalies if a.anomaly_type == AnomalyType.STATISTICAL), None
+        )
+        top_payload = None
+        if chart_anomaly is not None:
+            top_payload = await _build_anomaly_visualization(
+                conn,
+                product_model_id = chart_anomaly.product_model_id,
+                partner_id       = (await conn.fetchval(
+                    "SELECT partner_id FROM dim_partner WHERE partner_code=$1", chart_anomaly.partner_code,
+                )),
+                country_code     = chart_anomaly.country_code,
+                payment_type     = await conn.fetchval(
+                    "SELECT payment_type::text FROM fact_price_offer WHERE offer_id=$1", chart_anomaly.offer_id,
+                ) or "FULL",
+                anomaly_date     = chart_anomaly.detected_at.date() if chart_anomaly.detected_at else _now_utc().date(),
+                anomaly_price    = float(chart_anomaly.observed_price_usd),
+                mean_usd         = (chart_anomaly.context.baseline_snapshot.mean
+                                    if chart_anomaly.context.baseline_snapshot else float(chart_anomaly.observed_price_usd)),
+                std_usd          = (chart_anomaly.context.baseline_snapshot.stddev or 0.0
+                                    if chart_anomaly.context.baseline_snapshot else 0.0),
+            )
+        else:
+            top_payload = await _build_baseline_only_visualization(conn)
+
+        caption_top = (
+            f"Top: {top.anomaly_type.value} · {top.product_model_name} · "
+            f"{top.partner_code} · {top.country_code} · observed "
+            f"${top.observed_price_usd:,.2f} ({top.severity.value}) — {top.explanation}"
+        )
+        if chart_anomaly is None:
+            chart_note = " · chart shows baseline-only illustration (top signal is point-in-time, no STATISTICAL anomaly to plot)"
+        elif chart_anomaly is not top:
+            chart_note = (
+                f" · chart shows next-best STATISTICAL anomaly "
+                f"({chart_anomaly.product_model_name} · {chart_anomaly.partner_code})"
+            )
+        else:
+            chart_note = ""
+        caption = (
+            f"{caption_top}{chart_note} · "
+            f"read {len(anomalies)} anomaly row{'s' if len(anomalies) != 1 else ''} from "
+            f"fact_anomaly (last {LOOKBACK_DAYS} days)"
+        )
+        return AnomalyDashboardStats(
+            total_detected       = len(anomalies),
+            by_severity          = by_sev,
+            by_type              = by_type,
+            sample_visualization = top_payload,
+            sample_caption       = caption,
+            sample_severity      = top.severity,
+            is_real_anomaly      = True,
+            recent_anomalies     = recent_top,
+        )
+
+    # Fallback — no anomalies at all. Use the same baseline-only illustration
+    # as the non-STATISTICAL chart-fallback path so the dashboard never shows
+    # an empty Live Sample card.
+    sample_viz, baseline_caption = await _build_baseline_only_visualization(
+        conn, return_caption=True,
+    )
+    if sample_viz is None:
+        return AnomalyDashboardStats(
+            total_detected       = 0,
+            by_severity          = AnomaliesBySeverity(),
+            by_type              = {},
+            sample_visualization = None,
+            sample_caption       = "No anomalies detected · fact_price_offer too sparse for an illustrative baseline",
+            sample_severity      = None,
+            is_real_anomaly      = False,
+            recent_anomalies     = [],
+        )
+    return AnomalyDashboardStats(
+        total_detected       = 0,
+        by_severity          = AnomaliesBySeverity(),
+        by_type              = {},
+        sample_visualization = sample_viz,
+        sample_caption       = f"No anomalies in the latest batch — {baseline_caption}",
+        sample_severity      = None,
+        is_real_anomaly      = False,
+        recent_anomalies     = [],
+    )
+
+
+async def _build_baseline_only_visualization(
+    conn: asyncpg.Connection,
+    *,
+    return_caption: bool = False,
+):
+    """Pick the richest (model, partner, country, payment_type) group in
+    fact_price_offer and return its time-series + ±1σ band.
+
+    Used as a fallback when the dashboard's top anomaly isn't STATISTICAL (so
+    its native chart wouldn't be a 30-day series) or when there are no
+    anomalies at all. Excludes DQ_PRICE_001-flagged offers so 100x-typo
+    outliers don't dominate the variance ranking.
+
+    Returns AnomalyVisualization or None if fact is too sparse. When
+    return_caption=True returns (viz, caption_str) — caption is empty for the
+    None case.
+    """
+    top_hist = await conn.fetchrow(
+        """
+        WITH clean AS (
+          SELECT f.product_model_id, f.partner_id, f.country_code,
+                 f.payment_type, f.effective_total_usd
+          FROM fact_price_offer f
+          WHERE f.offer_id NOT IN (
+            SELECT (b.raw_payload->>'offer_id')::bigint
+            FROM dq_bad_records b
+            WHERE b.rule_id = 'DQ_PRICE_001'
+              AND b.raw_payload ? 'offer_id'
+          )
+        )
+        SELECT product_model_id, partner_id, country_code,
+               payment_type::text AS payment_type,
+               COUNT(*) AS n,
+               COALESCE(STDDEV(effective_total_usd), 0) AS sigma
+        FROM clean
+        GROUP BY product_model_id, partner_id, country_code, payment_type
+        HAVING COUNT(*) >= 3
+        ORDER BY (COALESCE(STDDEV(effective_total_usd), 0) > 0) DESC,
+                 COALESCE(STDDEV(effective_total_usd), 0) DESC,
+                 COUNT(*) DESC
+        LIMIT 1
+        """
+    )
+    if not top_hist or top_hist["n"] < 2:
+        return (None, "") if return_caption else None
+
+    series_rows = await conn.fetch(
+        """
+        SELECT crawl_ts_utc::date AS d,
+               AVG(effective_total_usd)::numeric(12,2) AS p
+        FROM fact_price_offer
+        WHERE product_model_id = $1
+          AND partner_id       = $2
+          AND country_code     = $3
+          AND payment_type     = $4::payment_type_enum
+          AND offer_id NOT IN (
+            SELECT (b.raw_payload->>'offer_id')::bigint
+            FROM dq_bad_records b
+            WHERE b.rule_id = 'DQ_PRICE_001'
+              AND b.raw_payload ? 'offer_id'
+          )
+        GROUP BY crawl_ts_utc::date
+        ORDER BY crawl_ts_utc::date
+        """,
+        top_hist["product_model_id"], top_hist["partner_id"],
+        top_hist["country_code"], top_hist["payment_type"],
+    )
+    prices = [float(r["p"]) for r in series_rows]
+    mean = sum(prices) / len(prices) if prices else 0.0
+    if len(prices) > 1:
+        var = sum((p - mean) ** 2 for p in prices) / (len(prices) - 1)
+        std = var ** 0.5
+    else:
+        std = 0.0
+
+    sample_viz = AnomalyVisualization(
+        type="time_series_with_band",
+        series=[TimeSeriesPoint(date=r["d"], price_usd=float(r["p"])) for r in series_rows],
+        baseline_band={
+            "mean":  round(mean, 2),
+            "lower": round(max(0.0, mean - std), 2),
+            "upper": round(mean + std, 2),
+        },
+        cross_partner_comparison=None,
+    )
+    if not return_caption:
+        return sample_viz
+
+    model_label = await conn.fetchval(
+        "SELECT model_key FROM dim_product_model WHERE product_model_id = $1",
+        top_hist["product_model_id"],
+    )
+    partner_label = await conn.fetchval(
+        "SELECT partner_code FROM dim_partner WHERE partner_id = $1",
+        top_hist["partner_id"],
+    )
+    caption = (
+        f"illustrative baseline from {model_label or 'top-history product'} · "
+        f"{partner_label or '?'} · {top_hist['country_code']} · "
+        f"{top_hist['payment_type']} ({top_hist['n']} history points)"
+    )
+    return sample_viz, caption

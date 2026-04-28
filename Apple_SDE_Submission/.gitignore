@@ -40,3 +40,7 @@ dist/
 .env
 .env.local
 *.local
+
+# ─── Local runtime artifacts (start.sh) ───
+.uvicorn.log
+.uvicorn.pid

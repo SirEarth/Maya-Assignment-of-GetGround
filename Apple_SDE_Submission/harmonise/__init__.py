@@ -3,7 +3,7 @@ Harmonise module — maps raw partner product names to canonical product models.
 
 Entry point:
     from harmonise import Harmoniser
-    h = Harmoniser("Apple SDE/Product Ref.csv")
+    h = Harmoniser("Product Ref.csv")
     results = h.match("iP 17 PM 512GB", k=5)
 """
 

@@ -15,8 +15,7 @@ What this script does NOT do:
     POST /load-data Application Programming Interface endpoint, NOT
     a bypass script.
 
-Run:
-    cd "Apple SDE"
+Run from the project folder (auto-invoked by start.sh on first install):
     python3 seed_bootstrap.py
 """
 

@@ -42,15 +42,21 @@ class JobStatus(str, Enum):
 
 class AnomalyType(str, Enum):
     """
-    Designed signal taxonomy. Current implementation only emits `STATISTICAL`
-    (compares observed price against the 30-day rolling mean from
-    `fact_partner_price_history`). The other three are scoped as future work;
-    `fact_anomaly` already has columns to hold their results.
+    Signal taxonomy. Anomaly detection answers "is this price unusual *relative*
+    to other observations" — it deliberately does NOT subsume DQ rule violations
+    (e.g. DQ_PRICE_001's per-category band check, which catches absolute-typo
+    errors). DQ and Anomaly are complementary mechanisms with separate review
+    paths (`/bad-records` vs `/detect-anomalies`).
+
+    All four signals are implemented; each has its own detector helper in
+    `api/services.py` and writes its own row to `fact_anomaly` (UNIQUE on
+    (offer_id, anomaly_type)). Severity is per-signal — independent severity
+    routing means HIGH on one signal doesn't dilute MEDIUM on another.
     """
-    STATISTICAL    = "STATISTICAL"   # implemented
-    TEMPORAL       = "TEMPORAL"      # design only — would compare to last valid price in SCD-2 history
-    CROSS_PARTNER  = "CROSS_PARTNER" # design only — would compare to other partners via v_partner_price_current
-    SKU_VARIANCE   = "SKU_VARIANCE"  # design only — would compute price spread across SKUs of same model
+    STATISTICAL      = "STATISTICAL"      # vs 30-day rolling baseline (mean / stddev from SCD-2 history)
+    TEMPORAL         = "TEMPORAL"         # vs the immediate previous price for the same key
+    CROSS_PARTNER    = "CROSS_PARTNER"    # vs peer-partner median via v_partner_price_current
+    SKU_VARIANCE     = "SKU_VARIANCE"     # z-score within same-model same-day same-partner group
 
 
 class LoadMode(str, Enum):
@@ -271,12 +277,110 @@ class PipelineResponse(BaseModel):
     partner_code:          str
     started_at:            datetime
     completed_at:          datetime
+    rows_stg:              int                  = Field(..., description="Rows in stg_price_offer for this batch (= rows parsed)")
     rows_loaded:           int                  = Field(..., description="Rows in fact_price_offer for this batch")
     rows_unchanged:        int                  = Field(..., description="Rows neither loaded to fact nor flagged bad")
     rows_bad:              int                  = Field(..., description="Rows in dq_bad_records for this batch")
+    rows_history:          int                  = Field(..., description="Rows added/updated in fact_partner_price_history")
     dq_summary:            DQSummary
+    dq_by_stage:           Dict[str, int]       = Field(default_factory=dict, description="DQ failed-record counts per stage: INGEST / PRE_FACT / SEMANTIC")
     anomalies_total:       int
     anomalies_by_severity: AnomaliesBySeverity
+
+
+# ---------------------------------------------------------------------------
+# /dashboard-stats — DB-wide aggregates for the live visualization dashboard
+# ---------------------------------------------------------------------------
+
+class DQRulePassRate(BaseModel):
+    """One rule's aggregated pass rate across all batches in the database."""
+    rule_id:        str
+    rule_name:      str
+    rule_category:  str
+    severity:       Severity
+    target_stage:   str
+    description:    Optional[str] = Field(default=None, description="Human-readable rule description from dq_rule_catalog.description")
+    total_records:  int
+    failed_records: int
+    pass_rate:      float = Field(..., ge=0, le=1)
+
+
+class DashboardTotals(BaseModel):
+    rows_stg:                int
+    rows_fact:               int
+    rows_history:            int
+    rows_bad:                int
+    rows_blocked_by_prefact: int   = Field(..., description="Distinct rows blocked at the PRE_FACT gate (across all batches)")
+    harmonise_high_pct:      float = Field(..., ge=0, le=1, description="Share of fact rows with HIGH harmonise confidence")
+    total_violations:        int   = Field(..., description="Same as rows_bad — kept for headline-card naming clarity")
+    batches_loaded:          int
+    rules_in_catalog:        int
+
+
+class FunnelStats(BaseModel):
+    stg:             int
+    ingest_passed:   int   = Field(..., description="stg rows with dq_status IN ('INGEST_PASSED','PRE_FACT_PASSED')")
+    after_harmonise: int   = Field(..., description="stg rows with product_model_id NOT NULL")
+    prefact_passed:  int   = Field(..., description="stg rows with dq_status = 'PRE_FACT_PASSED'")
+    fact:            int
+    history:         int
+
+
+class HarmoniseSample(BaseModel):
+    """One representative harmonise example with the full 3-signal breakdown,
+    designed for the showcase 'Real Match Examples' card on the dashboard."""
+    raw_product_name:   str
+    canonical_name:     str
+    model_key:          str
+    sku_ids:            List[int]   = Field(default_factory=list)
+    score:              float       = Field(..., ge=0, le=1)
+    confidence:         Confidence
+    signal_breakdown:   SignalBreakdown
+    note:               str         = Field(default="", description="Why this example is interesting (e.g. 'structural override fired')")
+
+
+class AnomalyDashboardStats(BaseModel):
+    """Anomaly detection summary across recent batches + one illustrative
+    visualization + per-signal breakdown + a list of the most-severe recent
+    anomalies for the dashboard table.
+
+    `sample_visualization` is always a STATISTICAL-style 30-day time-series
+    with ±1σ band: it shows the absolute top anomaly when that's STATISTICAL,
+    falls back to the highest STATISTICAL anomaly in the recent window when
+    the top is point-in-time (TEMPORAL / CROSS_PARTNER / SKU_VARIANCE), and
+    falls back to a baseline-only illustration from the richest-history
+    product when no STATISTICAL anomaly exists. `sample_caption` records
+    which path produced the chart.
+    """
+    total_detected:        int
+    by_severity:           AnomaliesBySeverity
+    by_type:               Dict[str, int] = Field(default_factory=dict, description="Anomaly counts per AnomalyType — all 4 signals (STATISTICAL / TEMPORAL / CROSS_PARTNER / SKU_VARIANCE)")
+    sample_visualization:  Optional[AnomalyVisualization] = None
+    sample_caption:        str  = Field(default="")
+    sample_severity:       Optional[Severity] = None
+    is_real_anomaly:       bool = Field(default=False, description="True if sample is a real triggered anomaly; False if showing baseline-only illustration")
+    recent_anomalies:      List[Anomaly] = Field(default_factory=list, description="Top-N most severe anomalies (sorted by severity then signal_score) for the dashboard table")
+
+
+class DashboardStats(BaseModel):
+    """DB-wide aggregate snapshot powering the live visualization dashboard.
+
+    Reads across ALL batches currently in the database — not scoped to a
+    single source_batch_id. Refreshes whenever the frontend polls the
+    GET /dashboard-stats endpoint.
+    """
+    snapshot_at:                       datetime
+    totals:                            DashboardTotals
+    harmonise_confidence:              Dict[str, int]      = Field(..., description="Counts per HIGH/MEDIUM/LOW/MANUAL across fact_price_offer")
+    dq_violations_by_severity:         DQViolationsBySeverity
+    dq_violations_by_stage:            Dict[str, int]      = Field(..., description="Bad-record counts by INGEST/PRE_FACT/SEMANTIC stage")
+    dq_pass_rates:                     List[DQRulePassRate]
+    funnel:                            FunnelStats
+    sample_bad_records:                List[BadRecordEntry] = Field(..., description="Recent N bad records (any rule)")
+    prefact_blocked_records:           List[BadRecordEntry] = Field(..., description="Full distinct list of rows blocked by the PRE_FACT gate (1 row per offending stg row, even if it failed multiple PRE_FACT rules)")
+    low_confidence_harmonise_records:  List[BadRecordEntry] = Field(..., description="Full list of DQ_HARM_001 (low-confidence harmonise) records — flagged-and-kept under SEMANTIC policy")
+    harmonise_samples:                 List[HarmoniseSample] = Field(..., description="Stratified harmonise examples with signal breakdown for the showcase 'Real Match Examples' card")
+    anomaly_stats:                     AnomalyDashboardStats
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +398,7 @@ class BadRecordEntry(BaseModel):
     bad_record_id:    int
     source_batch_id:  UUID
     rule_id:          str
+    target_stage:     Optional[str]      = Field(default=None, description="INGEST/PRE_FACT/SEMANTIC — looked up from dq_rule_catalog")
     failed_field:     Optional[str]
     error_message:    str
     severity:         Severity

@@ -44,6 +44,21 @@ PATTERN_EXPANSIONS = [
     # iPad size shorthand: "11in" / "11-inch" / '11"' → "11inch"
     (re.compile(r"(\d{1,2}(?:\.\d)?)\s*(?:in|inch|-inch)\b", re.I), r"\1inch"),
     (re.compile(r"(\d{1,2}(?:\.\d)?)\s*\"",                  re.I), r"\1inch"),
+    # ── AirPods / audio: collapse "active noise cancellation" → "anc"
+    # Critical: keep this BEFORE noise-word stripping so the discriminating
+    # ANC vs non-ANC signal survives (Reference has both `4th_generation_anc`
+    # and `4th_generation_non-anc` variants).
+    #
+    # NOTE: do NOT add an ordinal-stripping pattern (e.g. "4th" → "4"). Ordinals
+    # are part of the seeded `dim_product_model.model_key` (e.g. `airpods|
+    # 4th_generation_anc_4`). Stripping them at match time would produce a
+    # different signature than the registry, breaking the model_id lookup in
+    # services.py:harmonise_in_stg. The existing seed contract is intentional.
+    (re.compile(r"\bactive\s+noise\s+cancellation\b", re.I), r"anc"),
+    (re.compile(r"\bactive\s+noise\s+cancelling\b",   re.I), r"anc"),
+    (re.compile(r"\bnoise\s+cancellation\b",          re.I), r"anc"),
+    (re.compile(r"\bnoise\s+cancelling\b",            re.I), r"anc"),
+    (re.compile(r"\bnon[- ]?anc\b",                   re.I), r"non-anc"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -77,6 +92,17 @@ NOISE_WORDS = {
     "pnk", "pur", "stl", "blk", "ylw",
     # Descriptor words
     "brand", "new", "edition",
+    # ── Audio marketing fluff (AirPods variants ship with verbose names that
+    # add no model-discrimination signal — they just dilute Jaccard / fuzz
+    # signals). The ANC / non-ANC distinction is preserved separately via
+    # PATTERN_EXPANSIONS above; everything else here is safe to drop.
+    "wireless", "headphones", "earphones", "headphone", "earphone",
+    "in-ear", "true",
+    "magsafe", "lightning", "case", "charging",
+    "adaptive",
+    "battery", "life", "hours",
+    "hearing", "aid", "test", "clinical-grade",
+    "ios",
 }
 
 # ---------------------------------------------------------------------------

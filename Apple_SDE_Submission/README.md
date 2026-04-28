@@ -25,13 +25,33 @@ All five endpoints live behind Swagger UI at `/docs`.
 
 ---
 
+## Prerequisites
+
+Before running `start.sh`, you need these installed and **reachable from your shell**. The script *checks* for them and points you to install commands if any are missing — but it can't install them for you.
+
+| Required | Min version | macOS install (one-time) | Verify |
+|---|---|---|---|
+| **bash** | 3.2 (default macOS) | already on macOS | `bash --version` |
+| **Python 3** | 3.9+ (3.11 recommended) | `brew install python@3.11` | `python3 --version` |
+| **PostgreSQL server** | 14+ | drag [Postgres.app](https://postgresapp.com) to `/Applications/`, click **Initialize** | menubar shows the 🐘 icon |
+| **`psql` client** on PATH (or Postgres.app) | matches server | (Postgres.app ships its own — `start.sh` auto-detects it) | `psql --version` (or none — script auto-finds it) |
+| **`curl`** | any | already on macOS | `curl --version` |
+| **A modern browser** | Chrome / Safari / Firefox / Edge | already there | — |
+
+The script also installs (into a local `.venv`, no sudo needed):
+
+> `fastapi · pydantic >= 2 · uvicorn · asyncpg · psycopg2-binary · python-multipart · pytest · httpx`
+
+**Disk:** ~150 MB for `.venv` + ~30 MB for the seeded PostgreSQL database.
+**Ports:** the API binds **8000** by default — override via `PORT=9001 ./start.sh`.
+
+If `start.sh` reports a missing prerequisite, install it with the command in the table above and re-run — the script is idempotent.
+
+---
+
 ## Quick start
 
-Tested on macOS 14+. If you already have PostgreSQL 14+, Python 3.9+, and `pip`, jump to **Step 4**.
-
 ### Step 0 — Unzip & enter the folder
-
-You should have received this submission as a ZIP archive. Unzip it and `cd` into the resulting folder:
 
 ```bash
 # macOS (Finder double-click also works)
@@ -39,75 +59,62 @@ unzip Apple_SDE_Submission.zip
 cd Apple_SDE_Submission        # all subsequent commands run from here
 ```
 
-The folder you `cd` into should contain this `README.md`, plus `schema.sql`, `seed_bootstrap.py`, the three CSVs, and `api/` `dq/` `harmonise/` `submission/` directories.
+The folder should contain this `README.md`, `start.sh`, `schema.sql`, `seed_bootstrap.py`, the three CSVs, and `api/` `dq/` `harmonise/` `submission/` directories.
 
-### Step 1 — Install Homebrew (macOS package manager)
-
-```bash
-# Skip if you already have brew. Check with: which brew
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-```
-
-### Step 2 — Install Python 3.9+
+### Step 1 — One-click setup + run
 
 ```bash
-brew install python@3.11
-python3 --version    # should show 3.11.x or newer
+./start.sh
 ```
 
-### Step 3 — Install PostgreSQL 14+ (Postgres.app)
+That single command performs the whole bootstrap, idempotently:
 
-The simplest path on macOS is [Postgres.app](https://postgresapp.com):
+1. Verifies **Python 3** is on PATH
+2. Verifies **PostgreSQL** is reachable (auto-detects Postgres.app under `/Applications/`, Homebrew under `/opt/homebrew/bin`, or any `psql` on PATH)
+3. Builds a local **virtualenv** at `.venv` and installs Python deps (FastAPI, Pydantic 2, asyncpg, psycopg2-binary, pytest, httpx, …)
+4. Creates the **`maya_assignment`** database (skipped if it already exists), applies `schema.sql` + `dq/rules.sql` + `dq/rules_split.sql`, and runs `seed_bootstrap.py` for Product Reference + FX rates
+5. Runs the **47-test pytest suite** (skippable with `--no-tests`)
+6. Starts **uvicorn in the background** on port 8000, waits for `/health`, and **auto-opens the dashboard** in your default browser
 
-1. Download from <https://postgresapp.com> and drag into `/Applications`.
-2. Open the app and click **Initialize** — a 🐘 icon appears in the menu bar.
-3. Add `psql` to your `PATH`:
-    ```bash
-    sudo mkdir -p /etc/paths.d && \
-        echo /Applications/Postgres.app/Contents/Versions/latest/bin | \
-        sudo tee /etc/paths.d/postgresapp
-    ```
-4. **Open a new terminal** and verify:
-    ```bash
-    psql -U $USER postgres -c "SELECT version();"
-    ```
+When it's done, the dashboard ([`submission/pipeline_runner.html`](submission/pipeline_runner.html)) loads on top — drag a CSV, pick `PARTNER_A` or `PARTNER_B`, hit Run.
 
-(Alternatives: `brew install postgresql@16` or Docker. Adjust `api/db.py` if your username / port differ.)
-
-### Step 4 — Install Python dependencies
+### Other `start.sh` commands
 
 ```bash
-# Working directory is the folder you cd'd into in Step 0.
-pip3 install fastapi 'pydantic>=2' uvicorn asyncpg psycopg2-binary \
-             python-multipart pytest httpx
+./start.sh stop             # stop the API server (kept running in background)
+./start.sh status           # show pid + reachability
+./start.sh wipe             # TRUNCATE transactional tables (~0.5s) — keeps the
+                            #   seed dimensions + venv + running uvicorn process.
+                            #   Use this between test uploads to clear the dashboard
+                            #   without paying the full reset cost.
+./start.sh reset            # drop & recreate DB, then full bootstrap (wipes all
+                            #   tables AND re-runs schema + seed; ~10s)
+./start.sh --no-tests       # skip pytest during setup
+./start.sh --no-browser     # don't auto-open the dashboard
+./start.sh help             # full usage
 ```
 
-### Step 5 — Build the database and seed reference data
+### When to use `wipe` vs `reset`
+
+| Scenario | Use |
+|---|---|
+| Want a clean slate between test uploads (most common) | `./start.sh wipe` |
+| Schema changed (`schema.sql` / `dq/*.sql` edited) | `./start.sh reset` |
+| Product Reference / FX seed changed | `./start.sh reset` |
+| Server stuck / weird state | `./start.sh stop && ./start.sh reset` |
+
+### Manual fallback (if you'd rather run each step yourself)
 
 ```bash
 createdb maya_assignment
-
-psql -d maya_assignment -f schema.sql           # tables, indexes, partitions, dim seeds
-psql -d maya_assignment -f dq/rules.sql         # 13 Data Quality check functions
-psql -d maya_assignment -f dq/rules_split.sql   # INGEST / PRE_FACT / SEMANTIC orchestrators
-
-python3 seed_bootstrap.py                       # Product Reference + Foreign Exchange rates
-```
-
-### Step 6 — Run the test suite
-
-```bash
-python3 -m pytest -q
-#    → 44 passed in ~1 second (22 harmonise unit + 22 API integration covering
-#      Path A pipeline + 4 Path B sub-modules + path-parity tests)
-```
-
-### Step 7 — Start the API
-
-```bash
+psql -d maya_assignment -f schema.sql
+psql -d maya_assignment -f dq/rules.sql
+psql -d maya_assignment -f dq/rules_split.sql
+python3 -m pip install fastapi 'pydantic>=2' uvicorn asyncpg psycopg2-binary python-multipart pytest httpx
+python3 seed_bootstrap.py
+python3 -m pytest -q                 # 47 passed
 python3 -m uvicorn api.main:app --port 8000
-
-# Browser → http://localhost:8000/docs   (interactive Swagger UI)
+open submission/pipeline_runner.html
 ```
 
 ---
@@ -228,7 +235,7 @@ The actual implementation sits alongside this README:
 ├── seed_bootstrap.py     Loads dim_product_model + dim_currency_rate_snapshot
 ├── harmonise/            Three-signal Top-K matcher (6 modules + 22 tests)
 ├── dq/                   13 PL/pgSQL rules + 3-stage orchestrator
-├── api/                  FastAPI app + asyncpg pool + 17 integration tests
+├── api/                  FastAPI app + asyncpg pool + 22 integration tests
 └── submission/           The 5 artifacts above
 ```
 

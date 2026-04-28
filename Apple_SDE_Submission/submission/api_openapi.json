@@ -1,1 +1,2131 @@
-{"openapi":"3.1.0","info":{"title":"Pricing Pipeline API","description":"API (Application Programming Interface) for the partner-store pricing ingestion + analysis system.","contact":{"name":"huizhongwu"},"version":"0.1.0"},"paths":{"/health":{"get":{"tags":["meta"],"summary":"Liveness probe","operationId":"health_health_get","responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{}}}}}}},"/harmonise-product":{"get":{"tags":["harmonise"],"summary":"Harmonise a raw product name to canonical model(s)","description":"Returns up to **k** ranked candidate matches for a partner-supplied product name. Each candidate has a 0-1 score, a confidence bucket (HIGH / MEDIUM / LOW / MANUAL) and a per-signal breakdown for explainability.","operationId":"harmonise_product_harmonise_product_get","parameters":[{"name":"q","in":"query","required":true,"schema":{"type":"string","minLength":1,"description":"Raw product name to harmonise","title":"Q"},"description":"Raw product name to harmonise"},{"name":"k","in":"query","required":false,"schema":{"type":"integer","maximum":20,"minimum":1,"description":"Number of candidates to return","default":5,"title":"K"},"description":"Number of candidates to return"},{"name":"min_confidence","in":"query","required":false,"schema":{"$ref":"#/components/schemas/Confidence","description":"Minimum confidence bucket","default":"LOW"},"description":"Minimum confidence bucket"}],"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HarmoniseResponse"}}}},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}},"/load-data":{"post":{"tags":["ingest"],"summary":"Submit a CSV (Comma-Separated Values) batch and run the full ingest pipeline","description":"Accepts a multipart upload and runs the eight-step ingest pipeline in-process:\n\n  1. Parse CSV into `stg_price_offer`\n  2. Run INGEST-stage Data Quality rules (parse / format / required-field)\n  3. Harmonise raw product names against the canonical registry\n  4. Run PRE_FACT-stage Data Quality rules (HIGH-severity gate); failing rows are flagged in `dq_bad_records` and do NOT enter fact tables\n  5. Insert change events into `fact_price_offer` + payment child (only PRE_FACT-passing rows)\n  6. Run SEMANTIC-stage Data Quality rules on fact rows (soft signals; failures stay in fact and are flagged for review)\n  7. Update Slowly Changing Dimension Type 2 history\n  8. Write per-batch summary to `dws_partner_dq_per_batch`\n\nReturns `HTTP 202 Accepted` with a `job_id`. At sample-data scale (~4 000 rows) processing completes in seconds, so the response status is `COMPLETED` on return. The full async-queue + parallel-worker + AWS S3 (Amazon Simple Storage Service) staging path for million-row scale is the production design (see `task_c_answers.md` C.3).","operationId":"load_data_load_data_post","requestBody":{"content":{"multipart/form-data":{"schema":{"$ref":"#/components/schemas/Body_load_data_load_data_post"}}},"required":true},"responses":{"202":{"description":"Successful Response","content":{"application/json":{"schema":{"$ref":"#/components/schemas/LoadDataAcceptedResponse"}}}},"400":{"description":"Bad Request","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ErrorResponse"}}}},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}},"/load-data/{job_id}":{"get":{"tags":["ingest"],"summary":"Poll the progress / status of a load job","operationId":"get_load_job_load_data__job_id__get","parameters":[{"name":"job_id","in":"path","required":true,"schema":{"type":"string","format":"uuid","description":"The job_id returned by POST /load-data","title":"Job Id"},"description":"The job_id returned by POST /load-data"}],"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{"$ref":"#/components/schemas/LoadJobStatus"}}}},"404":{"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ErrorResponse"}}},"description":"Not Found"},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}},"/compute-dq":{"post":{"tags":["data-quality"],"summary":"Run Data Quality (DQ) rules against an ingestion batch","description":"Executes all active rules in `dq_rule_catalog` against the specified batch. Aggregates per-rule pass rates into `dq_output` and per-record violations into `dq_bad_records`.\n\nOptionally restrict to specific `rules` and/or `stages` (INGEST / PRE_FACT / SEMANTIC).","operationId":"compute_dq_compute_dq_post","requestBody":{"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ComputeDQRequest"}}},"required":true},"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ComputeDQResponse"}}}},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}},"/detect-anomalies":{"post":{"tags":["anomaly-detection"],"summary":"Detect pricing anomalies","description":"Runs the four-signal detector (STATISTICAL / TEMPORAL / CROSS_PARTNER / SKU_VARIANCE) over the specified scope.\n\nEach row in the response represents a single triggered signal — an offer that trips multiple signals appears as multiple anomaly entries, each routable to the appropriate team (see `fact_anomaly` in schema.sql).\n\nAll thresholds are read from `dim_anomaly_threshold` and frozen into the response context for replay/audit.","operationId":"detect_anomalies_detect_anomalies_post","requestBody":{"content":{"application/json":{"schema":{"$ref":"#/components/schemas/DetectAnomaliesRequest"}}},"required":true},"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{"$ref":"#/components/schemas/DetectAnomaliesResponse"}}}},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}},"/bad-records":{"get":{"tags":["business-review"],"summary":"List records flagged by Data Quality rules","description":"Powers the business-user review UI. Default filter: `status=NEW` to surface unresolved items. Pagination via `page` / `page_size`.","operationId":"list_bad_records_bad_records_get","parameters":[{"name":"status","in":"query","required":false,"schema":{"$ref":"#/components/schemas/BadRecordStatus","default":"NEW"}},{"name":"severity","in":"query","required":false,"schema":{"$ref":"#/components/schemas/Severity"}},{"name":"assignee","in":"query","required":false,"schema":{"type":"string","title":"Assignee"}},{"name":"page","in":"query","required":false,"schema":{"type":"integer","minimum":1,"default":1,"title":"Page"}},{"name":"page_size","in":"query","required":false,"schema":{"type":"integer","maximum":500,"minimum":1,"default":50,"title":"Page Size"}}],"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{"$ref":"#/components/schemas/BadRecordList"}}}},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}},"/bad-records/{bad_record_id}/resolve":{"post":{"tags":["business-review"],"summary":"Mark a bad record as resolved (or ignored)","description":"Triggers the business-correction loop. When `replay_batch=true`, the associated `source_batch_id` is re-ingested with the updated abbreviation dictionary / rules — only that batch is re-processed.","operationId":"resolve_bad_record_bad_records__bad_record_id__resolve_post","parameters":[{"name":"bad_record_id","in":"path","required":true,"schema":{"type":"integer","title":"Bad Record Id"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ResolveBadRecordRequest"}}}},"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ResolveBadRecordResponse"}}}},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}}},"components":{"schemas":{"AnomaliesBySeverity":{"properties":{"HIGH":{"type":"integer","title":"High","default":0},"MEDIUM":{"type":"integer","title":"Medium","default":0},"LOW":{"type":"integer","title":"Low","default":0}},"type":"object","title":"AnomaliesBySeverity"},"Anomaly":{"properties":{"anomaly_id":{"type":"integer","title":"Anomaly Id"},"offer_id":{"type":"integer","title":"Offer Id"},"anomaly_type":{"$ref":"#/components/schemas/AnomalyType"},"severity":{"$ref":"#/components/schemas/Severity"},"signal_score":{"type":"number","maximum":1.0,"minimum":0.0,"title":"Signal Score"},"product_model_id":{"type":"integer","title":"Product Model Id"},"product_model_name":{"type":"string","title":"Product Model Name"},"partner_code":{"type":"string","title":"Partner Code"},"country_code":{"type":"string","title":"Country Code"},"observed_price_usd":{"type":"number","title":"Observed Price Usd"},"explanation":{"type":"string","title":"Explanation"},"context":{"$ref":"#/components/schemas/AnomalyContext"},"visualization":{"anyOf":[{"$ref":"#/components/schemas/AnomalyVisualization"},{"type":"null"}]},"detected_at":{"type":"string","format":"date-time","title":"Detected At"}},"type":"object","required":["anomaly_id","offer_id","anomaly_type","severity","signal_score","product_model_id","product_model_name","partner_code","country_code","observed_price_usd","explanation","context","detected_at"],"title":"Anomaly"},"AnomalyContext":{"properties":{"lifecycle_status":{"type":"string","title":"Lifecycle Status"},"lifecycle_factor":{"type":"number","title":"Lifecycle Factor"},"event_suppression_factor":{"type":"number","title":"Event Suppression Factor","default":1.0},"suppression_applied":{"type":"boolean","title":"Suppression Applied","default":false},"suppression_event_id":{"anyOf":[{"type":"integer"},{"type":"null"}],"title":"Suppression Event Id"},"baseline_snapshot":{"anyOf":[{"$ref":"#/components/schemas/BaselineSnapshot"},{"type":"null"}]}},"type":"object","required":["lifecycle_status","lifecycle_factor"],"title":"AnomalyContext"},"AnomalyType":{"type":"string","enum":["STATISTICAL","TEMPORAL","CROSS_PARTNER","SKU_VARIANCE"],"title":"AnomalyType","description":"Designed signal taxonomy. Current implementation only emits `STATISTICAL`\n(compares observed price against the 30-day rolling mean from\n`fact_partner_price_history`). The other three are scoped as future work;\n`fact_anomaly` already has columns to hold their results."},"AnomalyVisualization":{"properties":{"type":{"type":"string","title":"Type","default":"time_series_with_band"},"series":{"items":{"$ref":"#/components/schemas/TimeSeriesPoint"},"type":"array","title":"Series"},"baseline_band":{"anyOf":[{"additionalProperties":{"type":"number"},"type":"object"},{"type":"null"}],"title":"Baseline Band"},"cross_partner_comparison":{"anyOf":[{"additionalProperties":{"type":"number"},"type":"object"},{"type":"null"}],"title":"Cross Partner Comparison"}},"type":"object","required":["series"],"title":"AnomalyVisualization","description":"Structured payload for frontend chart libraries (Chart.js / Recharts)."},"BadRecordEntry":{"properties":{"bad_record_id":{"type":"integer","title":"Bad Record Id"},"source_batch_id":{"type":"string","format":"uuid","title":"Source Batch Id"},"rule_id":{"type":"string","title":"Rule Id"},"failed_field":{"anyOf":[{"type":"string"},{"type":"null"}],"title":"Failed Field"},"error_message":{"type":"string","title":"Error Message"},"severity":{"$ref":"#/components/schemas/Severity"},"status":{"$ref":"#/components/schemas/BadRecordStatus"},"assignee":{"anyOf":[{"type":"string"},{"type":"null"}],"title":"Assignee"},"raw_payload":{"additionalProperties":true,"type":"object","title":"Raw Payload"},"detected_at":{"type":"string","format":"date-time","title":"Detected At"},"resolved_at":{"anyOf":[{"type":"string","format":"date-time"},{"type":"null"}],"title":"Resolved At"}},"type":"object","required":["bad_record_id","source_batch_id","rule_id","failed_field","error_message","severity","status","raw_payload","detected_at"],"title":"BadRecordEntry"},"BadRecordList":{"properties":{"total":{"type":"integer","title":"Total"},"page":{"type":"integer","title":"Page"},"page_size":{"type":"integer","title":"Page Size"},"items":{"items":{"$ref":"#/components/schemas/BadRecordEntry"},"type":"array","title":"Items"}},"type":"object","required":["total","page","page_size","items"],"title":"BadRecordList"},"BadRecordStatus":{"type":"string","enum":["NEW","IN_REVIEW","RESOLVED","IGNORED"],"title":"BadRecordStatus"},"BaselineSnapshot":{"properties":{"window_days":{"type":"integer","title":"Window Days"},"sample_size":{"type":"integer","title":"Sample Size"},"mean":{"type":"number","title":"Mean"},"stddev":{"anyOf":[{"type":"number"},{"type":"null"}],"title":"Stddev"},"p05":{"anyOf":[{"type":"number"},{"type":"null"}],"title":"P05"},"p50":{"anyOf":[{"type":"number"},{"type":"null"}],"title":"P50"},"p95":{"anyOf":[{"type":"number"},{"type":"null"}],"title":"P95"}},"type":"object","required":["window_days","sample_size","mean"],"title":"BaselineSnapshot","description":"Frozen snapshot of dws_product_price_baseline_1d at detection time."},"Body_load_data_load_data_post":{"properties":{"file":{"type":"string","format":"binary","title":"File","description":"CSV file"},"partner_code":{"type":"string","title":"Partner Code","description":"Partner identifier registered in dim_partner"}},"type":"object","required":["file","partner_code"],"title":"Body_load_data_load_data_post"},"ComputeDQRequest":{"properties":{"source_batch_id":{"type":"string","format":"uuid","title":"Source Batch Id","description":"Run DQ checks against this ingestion batch"},"rules":{"anyOf":[{"items":{"type":"string"},"type":"array"},{"type":"null"}],"title":"Rules","description":"Optional whitelist of rule_ids; default = all active"},"stages":{"anyOf":[{"items":{"type":"string"},"type":"array"},{"type":"null"}],"title":"Stages","description":"Optional subset of INGEST / PRE_FACT / SEMANTIC; default = all three"}},"type":"object","required":["source_batch_id"],"title":"ComputeDQRequest"},"ComputeDQResponse":{"properties":{"source_batch_id":{"type":"string","format":"uuid","title":"Source Batch Id"},"started_at":{"type":"string","format":"date-time","title":"Started At"},"completed_at":{"type":"string","format":"date-time","title":"Completed At"},"summary":{"$ref":"#/components/schemas/DQSummary"},"rule_runs":{"items":{"$ref":"#/components/schemas/DQRuleRunResult"},"type":"array","title":"Rule Runs"}},"type":"object","required":["source_batch_id","started_at","completed_at","summary","rule_runs"],"title":"ComputeDQResponse"},"Confidence":{"type":"string","enum":["HIGH","MEDIUM","LOW","MANUAL"],"title":"Confidence"},"DQRuleRunResult":{"properties":{"rule_id":{"type":"string","title":"Rule Id"},"rule_name":{"type":"string","title":"Rule Name"},"rule_category":{"type":"string","title":"Rule Category"},"severity":{"$ref":"#/components/schemas/Severity"},"target_stage":{"type":"string","title":"Target Stage","description":"INGEST, PRE_FACT, or SEMANTIC"},"total_records":{"type":"integer","title":"Total Records"},"failed_records":{"type":"integer","title":"Failed Records"},"pass_rate":{"type":"number","maximum":1.0,"minimum":0.0,"title":"Pass Rate"}},"type":"object","required":["rule_id","rule_name","rule_category","severity","target_stage","total_records","failed_records","pass_rate"],"title":"DQRuleRunResult","description":"One rule's run statistics — matches dq_output schema."},"DQSummary":{"properties":{"total_rules_run":{"type":"integer","title":"Total Rules Run"},"total_records":{"type":"integer","title":"Total Records","description":"Records examined (max across rules)"},"total_violations":{"type":"integer","title":"Total Violations"},"by_severity":{"$ref":"#/components/schemas/DQViolationsBySeverity"}},"type":"object","required":["total_rules_run","total_records","total_violations","by_severity"],"title":"DQSummary"},"DQViolationsBySeverity":{"properties":{"HIGH":{"type":"integer","title":"High","default":0},"MEDIUM":{"type":"integer","title":"Medium","default":0},"LOW":{"type":"integer","title":"Low","default":0}},"type":"object","title":"DQViolationsBySeverity"},"DateRange":{"properties":{"from":{"type":"string","format":"date","title":"From"},"to":{"type":"string","format":"date","title":"To"}},"type":"object","required":["from","to"],"title":"DateRange"},"DetectAnomaliesRequest":{"properties":{"source_batch_id":{"anyOf":[{"type":"string","format":"uuid"},{"type":"null"}],"title":"Source Batch Id","description":"Detect against this batch's offers (preferred)"},"date_range":{"anyOf":[{"$ref":"#/components/schemas/DateRange"},{"type":"null"}],"description":"Alternative: detect over a date range"},"product_model_ids":{"anyOf":[{"items":{"type":"integer"},"type":"array"},{"type":"null"}],"title":"Product Model Ids","description":"Filter to specific products"},"min_severity":{"$ref":"#/components/schemas/Severity","description":"Minimum severity to return","default":"LOW"}},"type":"object","title":"DetectAnomaliesRequest"},"DetectAnomaliesResponse":{"properties":{"detected_at":{"type":"string","format":"date-time","title":"Detected At"},"total_anomalies":{"type":"integer","title":"Total Anomalies"},"by_severity":{"$ref":"#/components/schemas/AnomaliesBySeverity"},"anomalies":{"items":{"$ref":"#/components/schemas/Anomaly"},"type":"array","title":"Anomalies"}},"type":"object","required":["detected_at","total_anomalies","by_severity","anomalies"],"title":"DetectAnomaliesResponse"},"ErrorResponse":{"properties":{"error":{"type":"string","title":"Error"},"detail":{"anyOf":[{"type":"string"},{"type":"null"}],"title":"Detail"},"code":{"anyOf":[{"type":"string"},{"type":"null"}],"title":"Code"}},"type":"object","required":["error"],"title":"ErrorResponse"},"HTTPValidationError":{"properties":{"detail":{"items":{"$ref":"#/components/schemas/ValidationError"},"type":"array","title":"Detail"}},"type":"object","title":"HTTPValidationError"},"HarmoniseMatch":{"properties":{"model_key":{"type":"string","title":"Model Key","description":"Canonical model identifier"},"canonical_name":{"type":"string","title":"Canonical Name","description":"Human-readable product name"},"sku_ids":{"items":{"type":"integer"},"type":"array","title":"Sku Ids","description":"Original Product Ref IDs grouped under this model (color variants)"},"score":{"type":"number","maximum":1.0,"minimum":0.0,"title":"Score","description":"Combined match score (0-1)"},"confidence":{"$ref":"#/components/schemas/Confidence","description":"HIGH/MEDIUM/LOW/MANUAL bucket"},"signal_breakdown":{"$ref":"#/components/schemas/SignalBreakdown"}},"type":"object","required":["model_key","canonical_name","sku_ids","score","confidence","signal_breakdown"],"title":"HarmoniseMatch","description":"One candidate match returned by /harmonise-product."},"HarmoniseResponse":{"properties":{"query":{"type":"string","title":"Query","description":"The product name as submitted"},"matches":{"items":{"$ref":"#/components/schemas/HarmoniseMatch"},"type":"array","title":"Matches","description":"Top-K candidate matches, ranked descending by score"},"elapsed_ms":{"type":"integer","title":"Elapsed Ms","description":"Server processing time"}},"type":"object","required":["query","matches","elapsed_ms"],"title":"HarmoniseResponse","description":"Response from GET /harmonise-product."},"JobStatus":{"type":"string","enum":["QUEUED","RUNNING","COMPLETED","FAILED","PARTIAL"],"title":"JobStatus"},"LoadDataAcceptedResponse":{"properties":{"job_id":{"type":"string","format":"uuid","title":"Job Id"},"source_batch_id":{"type":"string","format":"uuid","title":"Source Batch Id"},"status":{"$ref":"#/components/schemas/JobStatus","default":"QUEUED"},"poll_url":{"type":"string","title":"Poll Url"},"submitted_at":{"type":"string","format":"date-time","title":"Submitted At"}},"type":"object","required":["job_id","source_batch_id","poll_url","submitted_at"],"title":"LoadDataAcceptedResponse","description":"HTTP 202 Accepted — async ingest queued."},"LoadDataProgress":{"properties":{"chunk_count":{"type":"integer","title":"Chunk Count","description":"Total chunks the file was split into"},"completed_chunks":{"type":"integer","title":"Completed Chunks"},"rows_loaded":{"type":"integer","title":"Rows Loaded"},"rows_bad":{"type":"integer","title":"Rows Bad"},"percent_complete":{"type":"number","maximum":100.0,"minimum":0.0,"title":"Percent Complete"}},"type":"object","required":["chunk_count","completed_chunks","rows_loaded","rows_bad","percent_complete"],"title":"LoadDataProgress"},"LoadJobStatus":{"properties":{"job_id":{"type":"string","format":"uuid","title":"Job Id"},"source_batch_id":{"type":"string","format":"uuid","title":"Source Batch Id"},"status":{"$ref":"#/components/schemas/JobStatus"},"progress":{"$ref":"#/components/schemas/LoadDataProgress"},"started_at":{"anyOf":[{"type":"string","format":"date-time"},{"type":"null"}],"title":"Started At"},"estimated_completion_at":{"anyOf":[{"type":"string","format":"date-time"},{"type":"null"}],"title":"Estimated Completion At"},"error_message":{"anyOf":[{"type":"string"},{"type":"null"}],"title":"Error Message"}},"type":"object","required":["job_id","source_batch_id","status","progress"],"title":"LoadJobStatus","description":"Response for GET /load-data/{job_id}."},"ResolveAction":{"type":"string","enum":["RESOLVED","IGNORED"],"title":"ResolveAction"},"ResolveBadRecordRequest":{"properties":{"action":{"$ref":"#/components/schemas/ResolveAction"},"notes":{"anyOf":[{"type":"string"},{"type":"null"}],"title":"Notes"},"replay_batch":{"type":"boolean","title":"Replay Batch","description":"Re-ingest the batch with corrected rules / dictionary after resolving","default":false}},"type":"object","required":["action"],"title":"ResolveBadRecordRequest"},"ResolveBadRecordResponse":{"properties":{"bad_record_id":{"type":"integer","title":"Bad Record Id"},"new_status":{"$ref":"#/components/schemas/BadRecordStatus"},"resolved_at":{"type":"string","format":"date-time","title":"Resolved At"},"replay_triggered":{"type":"boolean","title":"Replay Triggered","default":false}},"type":"object","required":["bad_record_id","new_status","resolved_at"],"title":"ResolveBadRecordResponse"},"Severity":{"type":"string","enum":["HIGH","MEDIUM","LOW"],"title":"Severity"},"SignalBreakdown":{"properties":{"attr_match":{"type":"number","title":"Attr Match","description":"Structured attribute match score (0-1)"},"token_jaccard":{"type":"number","title":"Token Jaccard","description":"Token set Jaccard similarity (0-1)"},"char_fuzz":{"type":"number","title":"Char Fuzz","description":"Character-level fuzzy ratio (0-1)"},"attr_matched":{"items":{"type":"string"},"type":"array","title":"Attr Matched","description":"Attributes matched at >= 0.8 similarity"},"attr_mismatched":{"items":{"type":"string"},"type":"array","title":"Attr Mismatched","description":"Attributes mismatched at < 0.3 similarity"}},"type":"object","required":["attr_match","token_jaccard","char_fuzz"],"title":"SignalBreakdown","description":"Per-signal scoring detail — matches scorer.ScoreBreakdown."},"TimeSeriesPoint":{"properties":{"date":{"type":"string","format":"date","title":"Date"},"price_usd":{"type":"number","title":"Price Usd"},"is_anomaly":{"type":"boolean","title":"Is Anomaly","default":false}},"type":"object","required":["date","price_usd"],"title":"TimeSeriesPoint"},"ValidationError":{"properties":{"loc":{"items":{"anyOf":[{"type":"string"},{"type":"integer"}]},"type":"array","title":"Location"},"msg":{"type":"string","title":"Message"},"type":{"type":"string","title":"Error Type"},"input":{"title":"Input"},"ctx":{"type":"object","title":"Context"}},"type":"object","required":["loc","msg","type"],"title":"ValidationError"}}}}
+{
+    "openapi": "3.1.0",
+    "info": {
+        "title": "Pricing Pipeline API",
+        "description": "Multi-partner pricing ingestion + harmonisation + Data Quality + anomaly detection.\n\n**Path A \u2014 POST /pipeline**: one-click 9-step orchestrator.\n**Path B \u2014 sub-modules**: /load-data, /compute-dq, /detect-anomalies, /harmonise-product. Independently callable; combine in sequence to cover the same 9 steps with degraded gating semantics.",
+        "contact": {
+            "name": "huizhongwu"
+        },
+        "version": "0.2.0"
+    },
+    "paths": {
+        "/health": {
+            "get": {
+                "tags": [
+                    "meta"
+                ],
+                "summary": "Liveness probe",
+                "description": "Standard liveness probe for container-orchestration platforms.",
+                "operationId": "health_health_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/dashboard-stats": {
+            "get": {
+                "tags": [
+                    "meta"
+                ],
+                "summary": "DB-wide aggregate stats for the live visualization dashboard",
+                "description": "Cross-batch totals + harmonise distribution + per-rule pass rates + pipeline funnel + recent bad-record samples. Reads across ALL batches currently in the database \u2014 not scoped to a single source_batch_id. Powers `submission/pipeline_runner.html` and refreshes whenever the frontend polls this endpoint.",
+                "operationId": "dashboard_stats_dashboard_stats_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/DashboardStats"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/pipeline": {
+            "post": {
+                "tags": [
+                    "pipeline"
+                ],
+                "summary": "One-click orchestrator \u2014 runs all 9 steps end-to-end",
+                "description": "Runs the canonical 9-step pipeline in interleaved order:\n\n  1. Parse CSV \u2192 `stg_price_offer`\n  2. INGEST-stage Data Quality\n  3. Harmonise raw product names\n  4. PRE_FACT-stage Data Quality (HIGH-severity gate)\n  5. Insert into `fact_price_offer` + payment child (**only PRE_FACT-passing rows**)\n  6. SEMANTIC-stage Data Quality (soft signals; flag-and-keep)\n  7. Update Slowly Changing Dimension Type 2 history\n  8. Detect pricing anomalies on the new batch\n  9. Write per-batch summary to `dws_partner_dq_per_batch`\n\nSingle transaction. PRE_FACT bad rows are hard-blocked from `fact_price_offer`. Equivalent to calling /load-data + /compute-dq + /detect-anomalies in sequence except for stronger gating semantics (the sub-module path lets bad rows enter fact and flags them post-hoc).",
+                "operationId": "pipeline_pipeline_post",
+                "requestBody": {
+                    "content": {
+                        "multipart/form-data": {
+                            "schema": {
+                                "$ref": "#/components/schemas/Body_pipeline_pipeline_post"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/PipelineResponse"
+                                }
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ErrorResponse"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/load-data": {
+            "post": {
+                "tags": [
+                    "load-data"
+                ],
+                "summary": "Load CSV into the table (parse + harmonise + write fact + Slowly Changing Dimension Type 2)",
+                "description": "Task B sub-module \u2014 covers pipeline steps **1, 3, 5, 7, 9**:\n\n  1. Parse CSV into `stg_price_offer`\n  3. Harmonise raw product names against the canonical registry\n  5. Insert change events into `fact_price_offer` + payment child (**no PRE_FACT gate** \u2014 all rows with parseable fields enter fact; Data Quality flagging happens post-hoc via /compute-dq)\n  7. Update Slowly Changing Dimension Type 2 history\n  9. Write batch summary\n\nSteps 2/4/6 (Data Quality) and step 8 (anomaly detection) are NOT run here \u2014 call /compute-dq and /detect-anomalies separately, or use POST /pipeline for end-to-end with hard gating.",
+                "operationId": "load_data_load_data_post",
+                "requestBody": {
+                    "content": {
+                        "multipart/form-data": {
+                            "schema": {
+                                "$ref": "#/components/schemas/Body_load_data_load_data_post"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "responses": {
+                    "202": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/LoadDataAcceptedResponse"
+                                }
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ErrorResponse"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/load-data/{job_id}": {
+            "get": {
+                "tags": [
+                    "load-data"
+                ],
+                "summary": "Poll the progress / status of a load job",
+                "operationId": "get_load_job_load_data__job_id__get",
+                "parameters": [
+                    {
+                        "name": "job_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "format": "uuid",
+                            "description": "The job_id returned by POST /load-data",
+                            "title": "Job Id"
+                        },
+                        "description": "The job_id returned by POST /load-data"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/LoadJobStatus"
+                                }
+                            }
+                        }
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Not Found"
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/compute-dq": {
+            "post": {
+                "tags": [
+                    "compute-dq"
+                ],
+                "summary": "Validate Data Quality \u2014 runs all 13 rules and writes to dq_output + dq_bad_records",
+                "description": "Task B sub-module \u2014 covers pipeline steps **2, 4, 6, 9**:\n\n  2. INGEST-stage Data Quality (parse / format / required-field rules)\n  4. PRE_FACT-stage Data Quality (country\u2194currency, partner\u2194country, harmonise match)\n  6. SEMANTIC-stage Data Quality (soft signals \u2014 low-confidence harmonise, category sanity bounds)\n  9. Refresh batch summary\n\nAll 13 rules execute against the batch. Per-rule pass rates are stored in **`dq_output`**; per-row violations (with the original CSV payload preserved as JSONB) are stored in **`dq_bad_records`**.\n\nDesigned to be called AFTER /load-data has populated fact_price_offer. PRE_FACT-failing rows are flagged post-hoc \u2014 they remain in fact and must be filtered via `LEFT JOIN dq_bad_records` if downstream queries need a clean view. For end-to-end execution with hard gating, use POST /pipeline instead.",
+                "operationId": "compute_dq_compute_dq_post",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/ComputeDQRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ComputeDQResponse"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/detect-anomalies": {
+            "post": {
+                "tags": [
+                    "detect-anomalies"
+                ],
+                "summary": "Detect pricing anomalies + return visualization payload",
+                "description": "Task B sub-module \u2014 covers pipeline step **8** (and refreshes step 9 summary).\n\nFor each offer in scope, compares its USD price against the 30-day rolling mean from `fact_partner_price_history` (the Slowly Changing Dimension Type 2 table). Returns the anomaly list with severity classification (HIGH \u226525%, MEDIUM \u226515%, LOW \u226510%) and a structured visualization payload (time series + baseline band + cross-partner comparison) that the frontend can render directly via Chart.js / Recharts.",
+                "operationId": "detect_anomalies_detect_anomalies_post",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/DetectAnomaliesRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/DetectAnomaliesResponse"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/harmonise-product": {
+            "get": {
+                "tags": [
+                    "harmonise-product"
+                ],
+                "summary": "Harmonise a raw product name to canonical model(s) \u2014 Top-K + score",
+                "description": "Task B sub-module \u2014 exposes the harmoniser as an ad-hoc lookup. Returns up to **k** ranked candidate matches for a partner-supplied product name. Each candidate has a 0-1 score, a confidence bucket (HIGH / MEDIUM / LOW / MANUAL) and a per-signal breakdown for explainability.\n\nInternally, pipeline step 3 (`harmonise_in_stg`) calls this same harmoniser for every staged row during /load-data and /pipeline.",
+                "operationId": "harmonise_product_harmonise_product_get",
+                "parameters": [
+                    {
+                        "name": "q",
+                        "in": "query",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Raw product name to harmonise",
+                            "title": "Q"
+                        },
+                        "description": "Raw product name to harmonise"
+                    },
+                    {
+                        "name": "k",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "type": "integer",
+                            "maximum": 20,
+                            "minimum": 1,
+                            "description": "Number of candidates to return",
+                            "default": 5,
+                            "title": "K"
+                        },
+                        "description": "Number of candidates to return"
+                    },
+                    {
+                        "name": "min_confidence",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "$ref": "#/components/schemas/Confidence",
+                            "description": "Minimum confidence bucket",
+                            "default": "LOW"
+                        },
+                        "description": "Minimum confidence bucket"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HarmoniseResponse"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/bad-records": {
+            "get": {
+                "tags": [
+                    "business-review"
+                ],
+                "summary": "List records flagged by Data Quality rules",
+                "description": "Powers the business-user review UI. Default filter: `status=NEW` to surface unresolved items. Pagination via `page` / `page_size`.",
+                "operationId": "list_bad_records_bad_records_get",
+                "parameters": [
+                    {
+                        "name": "status",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "$ref": "#/components/schemas/BadRecordStatus",
+                            "default": "NEW"
+                        }
+                    },
+                    {
+                        "name": "severity",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "$ref": "#/components/schemas/Severity"
+                        }
+                    },
+                    {
+                        "name": "assignee",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "type": "string",
+                            "title": "Assignee"
+                        }
+                    },
+                    {
+                        "name": "page",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 1,
+                            "title": "Page"
+                        }
+                    },
+                    {
+                        "name": "page_size",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "type": "integer",
+                            "maximum": 500,
+                            "minimum": 1,
+                            "default": 50,
+                            "title": "Page Size"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/BadRecordList"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/bad-records/{bad_record_id}/resolve": {
+            "post": {
+                "tags": [
+                    "business-review"
+                ],
+                "summary": "Mark a bad record as resolved (or ignored)",
+                "description": "Triggers the business-correction loop. When `replay_batch=true`, the associated `source_batch_id` is re-ingested with the updated abbreviation dictionary / rules \u2014 only that batch is re-processed.",
+                "operationId": "resolve_bad_record_bad_records__bad_record_id__resolve_post",
+                "parameters": [
+                    {
+                        "name": "bad_record_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "integer",
+                            "title": "Bad Record Id"
+                        }
+                    }
+                ],
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/ResolveBadRecordRequest"
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ResolveBadRecordResponse"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "components": {
+        "schemas": {
+            "AnomaliesBySeverity": {
+                "properties": {
+                    "HIGH": {
+                        "type": "integer",
+                        "title": "High",
+                        "default": 0
+                    },
+                    "MEDIUM": {
+                        "type": "integer",
+                        "title": "Medium",
+                        "default": 0
+                    },
+                    "LOW": {
+                        "type": "integer",
+                        "title": "Low",
+                        "default": 0
+                    }
+                },
+                "type": "object",
+                "title": "AnomaliesBySeverity"
+            },
+            "Anomaly": {
+                "properties": {
+                    "anomaly_id": {
+                        "type": "integer",
+                        "title": "Anomaly Id"
+                    },
+                    "offer_id": {
+                        "type": "integer",
+                        "title": "Offer Id"
+                    },
+                    "anomaly_type": {
+                        "$ref": "#/components/schemas/AnomalyType"
+                    },
+                    "severity": {
+                        "$ref": "#/components/schemas/Severity"
+                    },
+                    "signal_score": {
+                        "type": "number",
+                        "maximum": 1.0,
+                        "minimum": 0.0,
+                        "title": "Signal Score"
+                    },
+                    "product_model_id": {
+                        "type": "integer",
+                        "title": "Product Model Id"
+                    },
+                    "product_model_name": {
+                        "type": "string",
+                        "title": "Product Model Name"
+                    },
+                    "partner_code": {
+                        "type": "string",
+                        "title": "Partner Code"
+                    },
+                    "country_code": {
+                        "type": "string",
+                        "title": "Country Code"
+                    },
+                    "observed_price_usd": {
+                        "type": "number",
+                        "title": "Observed Price Usd"
+                    },
+                    "explanation": {
+                        "type": "string",
+                        "title": "Explanation"
+                    },
+                    "context": {
+                        "$ref": "#/components/schemas/AnomalyContext"
+                    },
+                    "visualization": {
+                        "anyOf": [
+                            {
+                                "$ref": "#/components/schemas/AnomalyVisualization"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ]
+                    },
+                    "detected_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "title": "Detected At"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "anomaly_id",
+                    "offer_id",
+                    "anomaly_type",
+                    "severity",
+                    "signal_score",
+                    "product_model_id",
+                    "product_model_name",
+                    "partner_code",
+                    "country_code",
+                    "observed_price_usd",
+                    "explanation",
+                    "context",
+                    "detected_at"
+                ],
+                "title": "Anomaly"
+            },
+            "AnomalyContext": {
+                "properties": {
+                    "lifecycle_status": {
+                        "type": "string",
+                        "title": "Lifecycle Status"
+                    },
+                    "lifecycle_factor": {
+                        "type": "number",
+                        "title": "Lifecycle Factor"
+                    },
+                    "event_suppression_factor": {
+                        "type": "number",
+                        "title": "Event Suppression Factor",
+                        "default": 1.0
+                    },
+                    "suppression_applied": {
+                        "type": "boolean",
+                        "title": "Suppression Applied",
+                        "default": false
+                    },
+                    "suppression_event_id": {
+                        "anyOf": [
+                            {
+                                "type": "integer"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Suppression Event Id"
+                    },
+                    "baseline_snapshot": {
+                        "anyOf": [
+                            {
+                                "$ref": "#/components/schemas/BaselineSnapshot"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ]
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "lifecycle_status",
+                    "lifecycle_factor"
+                ],
+                "title": "AnomalyContext"
+            },
+            "AnomalyDashboardStats": {
+                "properties": {
+                    "total_detected": {
+                        "type": "integer",
+                        "title": "Total Detected"
+                    },
+                    "by_severity": {
+                        "$ref": "#/components/schemas/AnomaliesBySeverity"
+                    },
+                    "sample_visualization": {
+                        "anyOf": [
+                            {
+                                "$ref": "#/components/schemas/AnomalyVisualization"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ]
+                    },
+                    "sample_caption": {
+                        "type": "string",
+                        "title": "Sample Caption",
+                        "default": ""
+                    },
+                    "sample_severity": {
+                        "anyOf": [
+                            {
+                                "$ref": "#/components/schemas/Severity"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ]
+                    },
+                    "is_real_anomaly": {
+                        "type": "boolean",
+                        "title": "Is Real Anomaly",
+                        "description": "True if sample is a real triggered anomaly; False if showing baseline-only illustration",
+                        "default": false
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "total_detected",
+                    "by_severity"
+                ],
+                "title": "AnomalyDashboardStats",
+                "description": "Anomaly detection summary across recent batches + one illustrative\nvisualization. When no real anomalies exist, the sample falls back to a\nstable-baseline chart from the product with the richest history (still\nreal data, just no triggered anomaly point)."
+            },
+            "AnomalyType": {
+                "type": "string",
+                "enum": [
+                    "STATISTICAL",
+                    "TEMPORAL",
+                    "CROSS_PARTNER",
+                    "SKU_VARIANCE"
+                ],
+                "title": "AnomalyType",
+                "description": "Designed signal taxonomy. Current implementation only emits `STATISTICAL`\n(compares observed price against the 30-day rolling mean from\n`fact_partner_price_history`). The other three are scoped as future work;\n`fact_anomaly` already has columns to hold their results."
+            },
+            "AnomalyVisualization": {
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "title": "Type",
+                        "default": "time_series_with_band"
+                    },
+                    "series": {
+                        "items": {
+                            "$ref": "#/components/schemas/TimeSeriesPoint"
+                        },
+                        "type": "array",
+                        "title": "Series"
+                    },
+                    "baseline_band": {
+                        "anyOf": [
+                            {
+                                "additionalProperties": {
+                                    "type": "number"
+                                },
+                                "type": "object"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Baseline Band"
+                    },
+                    "cross_partner_comparison": {
+                        "anyOf": [
+                            {
+                                "additionalProperties": {
+                                    "type": "number"
+                                },
+                                "type": "object"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Cross Partner Comparison"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "series"
+                ],
+                "title": "AnomalyVisualization",
+                "description": "Structured payload for frontend chart libraries (Chart.js / Recharts)."
+            },
+            "BadRecordEntry": {
+                "properties": {
+                    "bad_record_id": {
+                        "type": "integer",
+                        "title": "Bad Record Id"
+                    },
+                    "source_batch_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "title": "Source Batch Id"
+                    },
+                    "rule_id": {
+                        "type": "string",
+                        "title": "Rule Id"
+                    },
+                    "target_stage": {
+                        "anyOf": [
+                            {
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Target Stage",
+                        "description": "INGEST/PRE_FACT/SEMANTIC \u2014 looked up from dq_rule_catalog"
+                    },
+                    "failed_field": {
+                        "anyOf": [
+                            {
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Failed Field"
+                    },
+                    "error_message": {
+                        "type": "string",
+                        "title": "Error Message"
+                    },
+                    "severity": {
+                        "$ref": "#/components/schemas/Severity"
+                    },
+                    "status": {
+                        "$ref": "#/components/schemas/BadRecordStatus"
+                    },
+                    "assignee": {
+                        "anyOf": [
+                            {
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Assignee"
+                    },
+                    "raw_payload": {
+                        "additionalProperties": true,
+                        "type": "object",
+                        "title": "Raw Payload"
+                    },
+                    "detected_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "title": "Detected At"
+                    },
+                    "resolved_at": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "format": "date-time"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Resolved At"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "bad_record_id",
+                    "source_batch_id",
+                    "rule_id",
+                    "failed_field",
+                    "error_message",
+                    "severity",
+                    "status",
+                    "raw_payload",
+                    "detected_at"
+                ],
+                "title": "BadRecordEntry"
+            },
+            "BadRecordList": {
+                "properties": {
+                    "total": {
+                        "type": "integer",
+                        "title": "Total"
+                    },
+                    "page": {
+                        "type": "integer",
+                        "title": "Page"
+                    },
+                    "page_size": {
+                        "type": "integer",
+                        "title": "Page Size"
+                    },
+                    "items": {
+                        "items": {
+                            "$ref": "#/components/schemas/BadRecordEntry"
+                        },
+                        "type": "array",
+                        "title": "Items"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "total",
+                    "page",
+                    "page_size",
+                    "items"
+                ],
+                "title": "BadRecordList"
+            },
+            "BadRecordStatus": {
+                "type": "string",
+                "enum": [
+                    "NEW",
+                    "IN_REVIEW",
+                    "RESOLVED",
+                    "IGNORED"
+                ],
+                "title": "BadRecordStatus"
+            },
+            "BaselineSnapshot": {
+                "properties": {
+                    "window_days": {
+                        "type": "integer",
+                        "title": "Window Days"
+                    },
+                    "sample_size": {
+                        "type": "integer",
+                        "title": "Sample Size"
+                    },
+                    "mean": {
+                        "type": "number",
+                        "title": "Mean"
+                    },
+                    "stddev": {
+                        "anyOf": [
+                            {
+                                "type": "number"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Stddev"
+                    },
+                    "p05": {
+                        "anyOf": [
+                            {
+                                "type": "number"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "P05"
+                    },
+                    "p50": {
+                        "anyOf": [
+                            {
+                                "type": "number"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "P50"
+                    },
+                    "p95": {
+                        "anyOf": [
+                            {
+                                "type": "number"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "P95"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "window_days",
+                    "sample_size",
+                    "mean"
+                ],
+                "title": "BaselineSnapshot",
+                "description": "Frozen snapshot of dws_product_price_baseline_1d at detection time."
+            },
+            "Body_load_data_load_data_post": {
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "format": "binary",
+                        "title": "File",
+                        "description": "CSV file"
+                    },
+                    "partner_code": {
+                        "type": "string",
+                        "title": "Partner Code",
+                        "description": "Partner identifier registered in dim_partner"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "file",
+                    "partner_code"
+                ],
+                "title": "Body_load_data_load_data_post"
+            },
+            "Body_pipeline_pipeline_post": {
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "format": "binary",
+                        "title": "File",
+                        "description": "CSV file"
+                    },
+                    "partner_code": {
+                        "type": "string",
+                        "title": "Partner Code",
+                        "description": "Partner identifier registered in dim_partner"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "file",
+                    "partner_code"
+                ],
+                "title": "Body_pipeline_pipeline_post"
+            },
+            "ComputeDQRequest": {
+                "properties": {
+                    "source_batch_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "title": "Source Batch Id",
+                        "description": "Run all 13 DQ rules against this ingestion batch"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "source_batch_id"
+                ],
+                "title": "ComputeDQRequest"
+            },
+            "ComputeDQResponse": {
+                "properties": {
+                    "source_batch_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "title": "Source Batch Id"
+                    },
+                    "started_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "title": "Started At"
+                    },
+                    "completed_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "title": "Completed At"
+                    },
+                    "summary": {
+                        "$ref": "#/components/schemas/DQSummary"
+                    },
+                    "rule_runs": {
+                        "items": {
+                            "$ref": "#/components/schemas/DQRuleRunResult"
+                        },
+                        "type": "array",
+                        "title": "Rule Runs"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "source_batch_id",
+                    "started_at",
+                    "completed_at",
+                    "summary",
+                    "rule_runs"
+                ],
+                "title": "ComputeDQResponse"
+            },
+            "Confidence": {
+                "type": "string",
+                "enum": [
+                    "HIGH",
+                    "MEDIUM",
+                    "LOW",
+                    "MANUAL"
+                ],
+                "title": "Confidence"
+            },
+            "DQRulePassRate": {
+                "properties": {
+                    "rule_id": {
+                        "type": "string",
+                        "title": "Rule Id"
+                    },
+                    "rule_name": {
+                        "type": "string",
+                        "title": "Rule Name"
+                    },
+                    "rule_category": {
+                        "type": "string",
+                        "title": "Rule Category"
+                    },
+                    "severity": {
+                        "$ref": "#/components/schemas/Severity"
+                    },
+                    "target_stage": {
+                        "type": "string",
+                        "title": "Target Stage"
+                    },
+                    "description": {
+                        "anyOf": [
+                            {
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Description",
+                        "description": "Human-readable rule description from dq_rule_catalog.description"
+                    },
+                    "total_records": {
+                        "type": "integer",
+                        "title": "Total Records"
+                    },
+                    "failed_records": {
+                        "type": "integer",
+                        "title": "Failed Records"
+                    },
+                    "pass_rate": {
+                        "type": "number",
+                        "maximum": 1.0,
+                        "minimum": 0.0,
+                        "title": "Pass Rate"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "rule_id",
+                    "rule_name",
+                    "rule_category",
+                    "severity",
+                    "target_stage",
+                    "total_records",
+                    "failed_records",
+                    "pass_rate"
+                ],
+                "title": "DQRulePassRate",
+                "description": "One rule's aggregated pass rate across all batches in the database."
+            },
+            "DQRuleRunResult": {
+                "properties": {
+                    "rule_id": {
+                        "type": "string",
+                        "title": "Rule Id"
+                    },
+                    "rule_name": {
+                        "type": "string",
+                        "title": "Rule Name"
+                    },
+                    "rule_category": {
+                        "type": "string",
+                        "title": "Rule Category"
+                    },
+                    "severity": {
+                        "$ref": "#/components/schemas/Severity"
+                    },
+                    "target_stage": {
+                        "type": "string",
+                        "title": "Target Stage",
+                        "description": "INGEST, PRE_FACT, or SEMANTIC"
+                    },
+                    "total_records": {
+                        "type": "integer",
+                        "title": "Total Records"
+                    },
+                    "failed_records": {
+                        "type": "integer",
+                        "title": "Failed Records"
+                    },
+                    "pass_rate": {
+                        "type": "number",
+                        "maximum": 1.0,
+                        "minimum": 0.0,
+                        "title": "Pass Rate"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "rule_id",
+                    "rule_name",
+                    "rule_category",
+                    "severity",
+                    "target_stage",
+                    "total_records",
+                    "failed_records",
+                    "pass_rate"
+                ],
+                "title": "DQRuleRunResult",
+                "description": "One rule's run statistics \u2014 matches dq_output schema."
+            },
+            "DQSummary": {
+                "properties": {
+                    "total_rules_run": {
+                        "type": "integer",
+                        "title": "Total Rules Run"
+                    },
+                    "total_records": {
+                        "type": "integer",
+                        "title": "Total Records",
+                        "description": "Records examined (max across rules)"
+                    },
+                    "total_violations": {
+                        "type": "integer",
+                        "title": "Total Violations"
+                    },
+                    "by_severity": {
+                        "$ref": "#/components/schemas/DQViolationsBySeverity"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "total_rules_run",
+                    "total_records",
+                    "total_violations",
+                    "by_severity"
+                ],
+                "title": "DQSummary"
+            },
+            "DQViolationsBySeverity": {
+                "properties": {
+                    "HIGH": {
+                        "type": "integer",
+                        "title": "High",
+                        "default": 0
+                    },
+                    "MEDIUM": {
+                        "type": "integer",
+                        "title": "Medium",
+                        "default": 0
+                    },
+                    "LOW": {
+                        "type": "integer",
+                        "title": "Low",
+                        "default": 0
+                    }
+                },
+                "type": "object",
+                "title": "DQViolationsBySeverity"
+            },
+            "DashboardStats": {
+                "properties": {
+                    "snapshot_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "title": "Snapshot At"
+                    },
+                    "totals": {
+                        "$ref": "#/components/schemas/DashboardTotals"
+                    },
+                    "harmonise_confidence": {
+                        "additionalProperties": {
+                            "type": "integer"
+                        },
+                        "type": "object",
+                        "title": "Harmonise Confidence",
+                        "description": "Counts per HIGH/MEDIUM/LOW/MANUAL across fact_price_offer"
+                    },
+                    "dq_violations_by_severity": {
+                        "$ref": "#/components/schemas/DQViolationsBySeverity"
+                    },
+                    "dq_violations_by_stage": {
+                        "additionalProperties": {
+                            "type": "integer"
+                        },
+                        "type": "object",
+                        "title": "Dq Violations By Stage",
+                        "description": "Bad-record counts by INGEST/PRE_FACT/SEMANTIC stage"
+                    },
+                    "dq_pass_rates": {
+                        "items": {
+                            "$ref": "#/components/schemas/DQRulePassRate"
+                        },
+                        "type": "array",
+                        "title": "Dq Pass Rates"
+                    },
+                    "funnel": {
+                        "$ref": "#/components/schemas/FunnelStats"
+                    },
+                    "sample_bad_records": {
+                        "items": {
+                            "$ref": "#/components/schemas/BadRecordEntry"
+                        },
+                        "type": "array",
+                        "title": "Sample Bad Records",
+                        "description": "Recent N bad records (any rule)"
+                    },
+                    "prefact_blocked_records": {
+                        "items": {
+                            "$ref": "#/components/schemas/BadRecordEntry"
+                        },
+                        "type": "array",
+                        "title": "Prefact Blocked Records",
+                        "description": "Full distinct list of rows blocked by the PRE_FACT gate (1 row per offending stg row, even if it failed multiple PRE_FACT rules)"
+                    },
+                    "low_confidence_harmonise_records": {
+                        "items": {
+                            "$ref": "#/components/schemas/BadRecordEntry"
+                        },
+                        "type": "array",
+                        "title": "Low Confidence Harmonise Records",
+                        "description": "Full list of DQ_HARM_001 (low-confidence harmonise) records \u2014 flagged-and-kept under SEMANTIC policy"
+                    },
+                    "harmonise_samples": {
+                        "items": {
+                            "$ref": "#/components/schemas/HarmoniseSample"
+                        },
+                        "type": "array",
+                        "title": "Harmonise Samples",
+                        "description": "Stratified harmonise examples with signal breakdown for the showcase 'Real Match Examples' card"
+                    },
+                    "anomaly_stats": {
+                        "$ref": "#/components/schemas/AnomalyDashboardStats"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "snapshot_at",
+                    "totals",
+                    "harmonise_confidence",
+                    "dq_violations_by_severity",
+                    "dq_violations_by_stage",
+                    "dq_pass_rates",
+                    "funnel",
+                    "sample_bad_records",
+                    "prefact_blocked_records",
+                    "low_confidence_harmonise_records",
+                    "harmonise_samples",
+                    "anomaly_stats"
+                ],
+                "title": "DashboardStats",
+                "description": "DB-wide aggregate snapshot powering the live visualization dashboard.\n\nReads across ALL batches currently in the database \u2014 not scoped to a\nsingle source_batch_id. Refreshes whenever the frontend polls the\nGET /dashboard-stats endpoint."
+            },
+            "DashboardTotals": {
+                "properties": {
+                    "rows_stg": {
+                        "type": "integer",
+                        "title": "Rows Stg"
+                    },
+                    "rows_fact": {
+                        "type": "integer",
+                        "title": "Rows Fact"
+                    },
+                    "rows_history": {
+                        "type": "integer",
+                        "title": "Rows History"
+                    },
+                    "rows_bad": {
+                        "type": "integer",
+                        "title": "Rows Bad"
+                    },
+                    "rows_blocked_by_prefact": {
+                        "type": "integer",
+                        "title": "Rows Blocked By Prefact",
+                        "description": "Distinct rows blocked at the PRE_FACT gate (across all batches)"
+                    },
+                    "harmonise_high_pct": {
+                        "type": "number",
+                        "maximum": 1.0,
+                        "minimum": 0.0,
+                        "title": "Harmonise High Pct",
+                        "description": "Share of fact rows with HIGH harmonise confidence"
+                    },
+                    "total_violations": {
+                        "type": "integer",
+                        "title": "Total Violations",
+                        "description": "Same as rows_bad \u2014 kept for headline-card naming clarity"
+                    },
+                    "batches_loaded": {
+                        "type": "integer",
+                        "title": "Batches Loaded"
+                    },
+                    "rules_in_catalog": {
+                        "type": "integer",
+                        "title": "Rules In Catalog"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "rows_stg",
+                    "rows_fact",
+                    "rows_history",
+                    "rows_bad",
+                    "rows_blocked_by_prefact",
+                    "harmonise_high_pct",
+                    "total_violations",
+                    "batches_loaded",
+                    "rules_in_catalog"
+                ],
+                "title": "DashboardTotals"
+            },
+            "DateRange": {
+                "properties": {
+                    "from": {
+                        "type": "string",
+                        "format": "date",
+                        "title": "From"
+                    },
+                    "to": {
+                        "type": "string",
+                        "format": "date",
+                        "title": "To"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "from",
+                    "to"
+                ],
+                "title": "DateRange"
+            },
+            "DetectAnomaliesRequest": {
+                "properties": {
+                    "source_batch_id": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "format": "uuid"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Source Batch Id",
+                        "description": "Detect against this batch's offers (preferred)"
+                    },
+                    "date_range": {
+                        "anyOf": [
+                            {
+                                "$ref": "#/components/schemas/DateRange"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "description": "Alternative: detect over a date range"
+                    },
+                    "product_model_ids": {
+                        "anyOf": [
+                            {
+                                "items": {
+                                    "type": "integer"
+                                },
+                                "type": "array"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Product Model Ids",
+                        "description": "Filter to specific products"
+                    },
+                    "min_severity": {
+                        "$ref": "#/components/schemas/Severity",
+                        "description": "Minimum severity to return",
+                        "default": "LOW"
+                    }
+                },
+                "type": "object",
+                "title": "DetectAnomaliesRequest"
+            },
+            "DetectAnomaliesResponse": {
+                "properties": {
+                    "detected_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "title": "Detected At"
+                    },
+                    "total_anomalies": {
+                        "type": "integer",
+                        "title": "Total Anomalies"
+                    },
+                    "by_severity": {
+                        "$ref": "#/components/schemas/AnomaliesBySeverity"
+                    },
+                    "anomalies": {
+                        "items": {
+                            "$ref": "#/components/schemas/Anomaly"
+                        },
+                        "type": "array",
+                        "title": "Anomalies"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "detected_at",
+                    "total_anomalies",
+                    "by_severity",
+                    "anomalies"
+                ],
+                "title": "DetectAnomaliesResponse"
+            },
+            "ErrorResponse": {
+                "properties": {
+                    "error": {
+                        "type": "string",
+                        "title": "Error"
+                    },
+                    "detail": {
+                        "anyOf": [
+                            {
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Detail"
+                    },
+                    "code": {
+                        "anyOf": [
+                            {
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Code"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "error"
+                ],
+                "title": "ErrorResponse"
+            },
+            "FunnelStats": {
+                "properties": {
+                    "stg": {
+                        "type": "integer",
+                        "title": "Stg"
+                    },
+                    "ingest_passed": {
+                        "type": "integer",
+                        "title": "Ingest Passed",
+                        "description": "stg rows with dq_status IN ('INGEST_PASSED','PRE_FACT_PASSED')"
+                    },
+                    "after_harmonise": {
+                        "type": "integer",
+                        "title": "After Harmonise",
+                        "description": "stg rows with product_model_id NOT NULL"
+                    },
+                    "prefact_passed": {
+                        "type": "integer",
+                        "title": "Prefact Passed",
+                        "description": "stg rows with dq_status = 'PRE_FACT_PASSED'"
+                    },
+                    "fact": {
+                        "type": "integer",
+                        "title": "Fact"
+                    },
+                    "history": {
+                        "type": "integer",
+                        "title": "History"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "stg",
+                    "ingest_passed",
+                    "after_harmonise",
+                    "prefact_passed",
+                    "fact",
+                    "history"
+                ],
+                "title": "FunnelStats"
+            },
+            "HTTPValidationError": {
+                "properties": {
+                    "detail": {
+                        "items": {
+                            "$ref": "#/components/schemas/ValidationError"
+                        },
+                        "type": "array",
+                        "title": "Detail"
+                    }
+                },
+                "type": "object",
+                "title": "HTTPValidationError"
+            },
+            "HarmoniseMatch": {
+                "properties": {
+                    "model_key": {
+                        "type": "string",
+                        "title": "Model Key",
+                        "description": "Canonical model identifier"
+                    },
+                    "canonical_name": {
+                        "type": "string",
+                        "title": "Canonical Name",
+                        "description": "Human-readable product name"
+                    },
+                    "sku_ids": {
+                        "items": {
+                            "type": "integer"
+                        },
+                        "type": "array",
+                        "title": "Sku Ids",
+                        "description": "Original Product Ref IDs grouped under this model (color variants)"
+                    },
+                    "score": {
+                        "type": "number",
+                        "maximum": 1.0,
+                        "minimum": 0.0,
+                        "title": "Score",
+                        "description": "Combined match score (0-1)"
+                    },
+                    "confidence": {
+                        "$ref": "#/components/schemas/Confidence",
+                        "description": "HIGH/MEDIUM/LOW/MANUAL bucket"
+                    },
+                    "signal_breakdown": {
+                        "$ref": "#/components/schemas/SignalBreakdown"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "model_key",
+                    "canonical_name",
+                    "sku_ids",
+                    "score",
+                    "confidence",
+                    "signal_breakdown"
+                ],
+                "title": "HarmoniseMatch",
+                "description": "One candidate match returned by /harmonise-product."
+            },
+            "HarmoniseResponse": {
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "title": "Query",
+                        "description": "The product name as submitted"
+                    },
+                    "matches": {
+                        "items": {
+                            "$ref": "#/components/schemas/HarmoniseMatch"
+                        },
+                        "type": "array",
+                        "title": "Matches",
+                        "description": "Top-K candidate matches, ranked descending by score"
+                    },
+                    "elapsed_ms": {
+                        "type": "integer",
+                        "title": "Elapsed Ms",
+                        "description": "Server processing time"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "query",
+                    "matches",
+                    "elapsed_ms"
+                ],
+                "title": "HarmoniseResponse",
+                "description": "Response from GET /harmonise-product."
+            },
+            "HarmoniseSample": {
+                "properties": {
+                    "raw_product_name": {
+                        "type": "string",
+                        "title": "Raw Product Name"
+                    },
+                    "canonical_name": {
+                        "type": "string",
+                        "title": "Canonical Name"
+                    },
+                    "model_key": {
+                        "type": "string",
+                        "title": "Model Key"
+                    },
+                    "sku_ids": {
+                        "items": {
+                            "type": "integer"
+                        },
+                        "type": "array",
+                        "title": "Sku Ids"
+                    },
+                    "score": {
+                        "type": "number",
+                        "maximum": 1.0,
+                        "minimum": 0.0,
+                        "title": "Score"
+                    },
+                    "confidence": {
+                        "$ref": "#/components/schemas/Confidence"
+                    },
+                    "signal_breakdown": {
+                        "$ref": "#/components/schemas/SignalBreakdown"
+                    },
+                    "note": {
+                        "type": "string",
+                        "title": "Note",
+                        "description": "Why this example is interesting (e.g. 'structural override fired')",
+                        "default": ""
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "raw_product_name",
+                    "canonical_name",
+                    "model_key",
+                    "score",
+                    "confidence",
+                    "signal_breakdown"
+                ],
+                "title": "HarmoniseSample",
+                "description": "One representative harmonise example with the full 3-signal breakdown,\ndesigned for the showcase 'Real Match Examples' card on the dashboard."
+            },
+            "JobStatus": {
+                "type": "string",
+                "enum": [
+                    "QUEUED",
+                    "RUNNING",
+                    "COMPLETED",
+                    "FAILED",
+                    "PARTIAL"
+                ],
+                "title": "JobStatus"
+            },
+            "LoadDataAcceptedResponse": {
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "title": "Job Id"
+                    },
+                    "source_batch_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "title": "Source Batch Id"
+                    },
+                    "status": {
+                        "$ref": "#/components/schemas/JobStatus",
+                        "default": "QUEUED"
+                    },
+                    "poll_url": {
+                        "type": "string",
+                        "title": "Poll Url"
+                    },
+                    "submitted_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "title": "Submitted At"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "job_id",
+                    "source_batch_id",
+                    "poll_url",
+                    "submitted_at"
+                ],
+                "title": "LoadDataAcceptedResponse",
+                "description": "HTTP 202 Accepted \u2014 async ingest queued."
+            },
+            "LoadDataProgress": {
+                "properties": {
+                    "chunk_count": {
+                        "type": "integer",
+                        "title": "Chunk Count",
+                        "description": "Total chunks the file was split into"
+                    },
+                    "completed_chunks": {
+                        "type": "integer",
+                        "title": "Completed Chunks"
+                    },
+                    "rows_loaded": {
+                        "type": "integer",
+                        "title": "Rows Loaded"
+                    },
+                    "rows_bad": {
+                        "type": "integer",
+                        "title": "Rows Bad"
+                    },
+                    "percent_complete": {
+                        "type": "number",
+                        "maximum": 100.0,
+                        "minimum": 0.0,
+                        "title": "Percent Complete"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "chunk_count",
+                    "completed_chunks",
+                    "rows_loaded",
+                    "rows_bad",
+                    "percent_complete"
+                ],
+                "title": "LoadDataProgress"
+            },
+            "LoadJobStatus": {
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "title": "Job Id"
+                    },
+                    "source_batch_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "title": "Source Batch Id"
+                    },
+                    "status": {
+                        "$ref": "#/components/schemas/JobStatus"
+                    },
+                    "progress": {
+                        "$ref": "#/components/schemas/LoadDataProgress"
+                    },
+                    "started_at": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "format": "date-time"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Started At"
+                    },
+                    "estimated_completion_at": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "format": "date-time"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Estimated Completion At"
+                    },
+                    "error_message": {
+                        "anyOf": [
+                            {
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Error Message"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "job_id",
+                    "source_batch_id",
+                    "status",
+                    "progress"
+                ],
+                "title": "LoadJobStatus",
+                "description": "Response for GET /load-data/{job_id}."
+            },
+            "PipelineResponse": {
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "title": "Job Id"
+                    },
+                    "source_batch_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "title": "Source Batch Id"
+                    },
+                    "partner_code": {
+                        "type": "string",
+                        "title": "Partner Code"
+                    },
+                    "started_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "title": "Started At"
+                    },
+                    "completed_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "title": "Completed At"
+                    },
+                    "rows_stg": {
+                        "type": "integer",
+                        "title": "Rows Stg",
+                        "description": "Rows in stg_price_offer for this batch (= rows parsed)"
+                    },
+                    "rows_loaded": {
+                        "type": "integer",
+                        "title": "Rows Loaded",
+                        "description": "Rows in fact_price_offer for this batch"
+                    },
+                    "rows_unchanged": {
+                        "type": "integer",
+                        "title": "Rows Unchanged",
+                        "description": "Rows neither loaded to fact nor flagged bad"
+                    },
+                    "rows_bad": {
+                        "type": "integer",
+                        "title": "Rows Bad",
+                        "description": "Rows in dq_bad_records for this batch"
+                    },
+                    "rows_history": {
+                        "type": "integer",
+                        "title": "Rows History",
+                        "description": "Rows added/updated in fact_partner_price_history"
+                    },
+                    "dq_summary": {
+                        "$ref": "#/components/schemas/DQSummary"
+                    },
+                    "dq_by_stage": {
+                        "additionalProperties": {
+                            "type": "integer"
+                        },
+                        "type": "object",
+                        "title": "Dq By Stage",
+                        "description": "DQ failed-record counts per stage: INGEST / PRE_FACT / SEMANTIC"
+                    },
+                    "anomalies_total": {
+                        "type": "integer",
+                        "title": "Anomalies Total"
+                    },
+                    "anomalies_by_severity": {
+                        "$ref": "#/components/schemas/AnomaliesBySeverity"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "job_id",
+                    "source_batch_id",
+                    "partner_code",
+                    "started_at",
+                    "completed_at",
+                    "rows_stg",
+                    "rows_loaded",
+                    "rows_unchanged",
+                    "rows_bad",
+                    "rows_history",
+                    "dq_summary",
+                    "anomalies_total",
+                    "anomalies_by_severity"
+                ],
+                "title": "PipelineResponse",
+                "description": "Aggregated result of the 9-step orchestrator.\n\nThe orchestrator interleaves the 4 sub-modules' work in the canonical\npipeline order (parse \u2192 ingest_dq \u2192 harmonise \u2192 prefact_dq \u2192 fact_write\nwith hard gate \u2192 semantic_dq \u2192 scd2 \u2192 anomaly_detection \u2192 summary).\nSub-module endpoints can replicate steps 1-9 in grouped fashion (see\n/load-data, /compute-dq, /detect-anomalies); the orchestrator exists\nfor a one-shot call with strict PRE_FACT gating semantics."
+            },
+            "ResolveAction": {
+                "type": "string",
+                "enum": [
+                    "RESOLVED",
+                    "IGNORED"
+                ],
+                "title": "ResolveAction"
+            },
+            "ResolveBadRecordRequest": {
+                "properties": {
+                    "action": {
+                        "$ref": "#/components/schemas/ResolveAction"
+                    },
+                    "notes": {
+                        "anyOf": [
+                            {
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Notes"
+                    },
+                    "replay_batch": {
+                        "type": "boolean",
+                        "title": "Replay Batch",
+                        "description": "Re-ingest the batch with corrected rules / dictionary after resolving",
+                        "default": false
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "action"
+                ],
+                "title": "ResolveBadRecordRequest"
+            },
+            "ResolveBadRecordResponse": {
+                "properties": {
+                    "bad_record_id": {
+                        "type": "integer",
+                        "title": "Bad Record Id"
+                    },
+                    "new_status": {
+                        "$ref": "#/components/schemas/BadRecordStatus"
+                    },
+                    "resolved_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "title": "Resolved At"
+                    },
+                    "replay_triggered": {
+                        "type": "boolean",
+                        "title": "Replay Triggered",
+                        "default": false
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "bad_record_id",
+                    "new_status",
+                    "resolved_at"
+                ],
+                "title": "ResolveBadRecordResponse"
+            },
+            "Severity": {
+                "type": "string",
+                "enum": [
+                    "HIGH",
+                    "MEDIUM",
+                    "LOW"
+                ],
+                "title": "Severity"
+            },
+            "SignalBreakdown": {
+                "properties": {
+                    "attr_match": {
+                        "type": "number",
+                        "title": "Attr Match",
+                        "description": "Structured attribute match score (0-1)"
+                    },
+                    "token_jaccard": {
+                        "type": "number",
+                        "title": "Token Jaccard",
+                        "description": "Token set Jaccard similarity (0-1)"
+                    },
+                    "char_fuzz": {
+                        "type": "number",
+                        "title": "Char Fuzz",
+                        "description": "Character-level fuzzy ratio (0-1)"
+                    },
+                    "attr_matched": {
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array",
+                        "title": "Attr Matched",
+                        "description": "Attributes matched at >= 0.8 similarity"
+                    },
+                    "attr_mismatched": {
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array",
+                        "title": "Attr Mismatched",
+                        "description": "Attributes mismatched at < 0.3 similarity"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "attr_match",
+                    "token_jaccard",
+                    "char_fuzz"
+                ],
+                "title": "SignalBreakdown",
+                "description": "Per-signal scoring detail \u2014 matches scorer.ScoreBreakdown."
+            },
+            "TimeSeriesPoint": {
+                "properties": {
+                    "date": {
+                        "type": "string",
+                        "format": "date",
+                        "title": "Date"
+                    },
+                    "price_usd": {
+                        "type": "number",
+                        "title": "Price Usd"
+                    },
+                    "is_anomaly": {
+                        "type": "boolean",
+                        "title": "Is Anomaly",
+                        "default": false
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "date",
+                    "price_usd"
+                ],
+                "title": "TimeSeriesPoint"
+            },
+            "ValidationError": {
+                "properties": {
+                    "loc": {
+                        "items": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "integer"
+                                }
+                            ]
+                        },
+                        "type": "array",
+                        "title": "Location"
+                    },
+                    "msg": {
+                        "type": "string",
+                        "title": "Message"
+                    },
+                    "type": {
+                        "type": "string",
+                        "title": "Error Type"
+                    },
+                    "input": {
+                        "title": "Input"
+                    },
+                    "ctx": {
+                        "type": "object",
+                        "title": "Context"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "loc",
+                    "msg",
+                    "type"
+                ],
+                "title": "ValidationError"
+            }
+        }
+    }
+}

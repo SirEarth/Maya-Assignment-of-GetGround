@@ -186,7 +186,7 @@ class TestScorer:
 def _ref_path():
     here = Path(__file__).resolve().parent
     candidates = [
-        here.parent.parent / "Product Ref.csv",    # Apple SDE/Product Ref.csv
+        here.parent.parent / "Product Ref.csv",    # project root
     ]
     return next((p for p in candidates if p.exists()), None)
 

@@ -72,7 +72,7 @@ class Harmoniser:
     Hybrid structured + fuzzy product name harmoniser.
 
     Usage:
-        h = Harmoniser("Apple SDE/Product Ref.csv")
+        h = Harmoniser("Product Ref.csv")
         results = h.match("iP 17 PM 512GB", k=5)
         for r in results:
             print(r.model_key, r.score, r.confidence)

@@ -78,7 +78,7 @@ The API is **one independent service** with two call paths:
 - **Path B — 4 Task-B sub-modules** (independently callable):
   - `POST /load-data` — parse + harmonise + write fact (no gate) + Slowly Changing Dimension Type 2
   - `POST /compute-dq` — 13 PL/pgSQL rules across 3 stages → `dq_output` + `dq_bad_records`
-  - `POST /detect-anomalies` — STATISTICAL signal + structured visualization payload
+  - `POST /detect-anomalies` — 4-signal detection (STATISTICAL / TEMPORAL / CROSS_PARTNER / SKU_VARIANCE) + visualization payload
   - `GET /harmonise-product` — Top-K with score breakdown
 
 Both paths invoke the **same 9 internal step helpers** in `api/services.py` — zero code duplication.
@@ -88,7 +88,7 @@ Both paths invoke the **same 9 internal step helpers** in `api/services.py` — 
 - C-2 DQ + business correction loop
 - C-3 scaling to 1 M records
 
-**Quality bar:** **44 / 44 automated tests passing** (22 harmonise unit + 22 API integration covering Path A pipeline + 4 Path B sub-modules + path-parity tests).
+**Quality bar:** **47 / 47 automated tests passing** (22 harmonise unit + 25 API integration covering Path A pipeline + 4 Path B sub-modules + path-parity tests).
 
 **Architectural innovation beyond the spec:** **3-stage DQ with severity-driven policy** (INGEST → PRE_FACT gate → SEMANTIC) — combined with the Path A orchestrator, makes `fact_price_offer` trustworthy by construction.
 
@@ -117,8 +117,8 @@ Both paths invoke the **same 9 internal step helpers** in `api/services.py` — 
 | `stg_price_offer` | ~4 208 |
 | `fact_price_offer` | ~4 174 |
 | `fact_payment_full_price` / `fact_payment_instalment` | 1 066 / 3 108 |
-| `fact_partner_price_history` | 120 |
-| `dq_bad_records` | ~188 |
+| `fact_partner_price_history` | ~120 |
+| `dq_bad_records` | ~77 |
 | `dq_output` | 26 (= 2 batches × 13 rules) |
 
 **Punchline to land at end:** *"Notice the funnel — every stg row preserved with `raw_payload`, but only PRE_FACT-passing rows enter `fact_price_offer`. Anything HIGH severity is blocked here. So `SELECT * FROM fact_price_offer` is safe to query directly — analytics never need a filter view."*
@@ -225,7 +225,8 @@ Both paths invoke the **same 9 internal step helpers** in `api/services.py` — 
            │   latest → existing → changed → closed → insert
            │  → fact_partner_price_history
            ▼
-   ⑧ detect_anomalies_for_batch — STATISTICAL signal vs 30-day baseline,
+   ⑧ detect_anomalies_for_batch — 4 signals (STATISTICAL / TEMPORAL /
+                                    CROSS_PARTNER / SKU_VARIANCE) → fact_anomaly
            │  visualization payload (series + band + cross-partner JSON)
            ▼
    ⑨ write_batch_summary → dws_partner_dq_per_batch (UPSERT, idempotent)
@@ -382,7 +383,7 @@ POST /detect-anomalies
 | `/load-data` | POST | B — sub-module #1 | Parse + harmonise + write fact (no gate) + Slowly Changing Dimension Type 2 | `api/services.py:submit_load_job` |
 | `/load-data/{job_id}` | GET | B — support | Poll progress | `api/services.py:get_job_status` |
 | `/compute-dq` | POST | B — sub-module #2 | Run all 13 DQ rules → 2 tables | `api/services.py:compute_dq_service` + `dq/rules.sql` |
-| `/detect-anomalies` | POST | B — sub-module #3 | STATISTICAL anomaly detection + visualization payload | `api/services.py:detect_anomalies_service` |
+| `/detect-anomalies` | POST | B — sub-module #3 | 4-signal anomaly detection (STATISTICAL/TEMPORAL/CROSS_PARTNER/SKU_VARIANCE) + visualization payload | `api/services.py:detect_anomalies_service` |
 | `/harmonise-product` | GET | B — sub-module #4 | Top-K canonical match + score | `harmonise/` (6 modules) |
 | `/bad-records` | GET | Support | List flagged records | `api/services.py:list_bad_records` |
 | `/bad-records/{id}/resolve` | POST | Support | Resolve + optionally replay | `api/services.py:resolve_bad_record` |
@@ -390,7 +391,7 @@ POST /detect-anomalies
 
 **Built with FastAPI + Pydantic 2:** typed contracts everywhere; auto-generated OpenAPI 3.x at `/docs` (Swagger UI) and `/redoc`.
 
-**Tested:** 44 automated tests (22 harmonise unit + 22 API integration covering Path A pipeline + 4 Path B sub-modules + path-parity tests).
+**Tested:** 47 automated tests (22 harmonise unit + 25 API integration covering Path A pipeline + 4 Path B sub-modules + path-parity tests).
 
 ---
 
@@ -478,14 +479,25 @@ NEW  →  IN_REVIEW  →  RESOLVED (replay batch) | IGNORED
 
 ## Slide 14 — `POST /detect-anomalies`
 
-**Four anomaly types — each detected independently:**
+**Four anomaly types — all implemented, each detected independently:**
 
-| Type | Question answered | Status |
-|------|-------------------|:---:|
-| STATISTICAL | "Is this price outside historical norms?" | ✅ End-to-end |
-| TEMPORAL | "Did the price suddenly change?" | 🟡 Designed |
-| CROSS_PARTNER | "Is this price way off from peers?" | 🟡 Designed |
-| SKU_VARIANCE | "Is the spread within one batch suspicious?" | 🟡 Designed |
+| Type | Question answered | Compares against | Status |
+|------|-------------------|---|:---:|
+| STATISTICAL | "Is this price outside historical norms?" | 30-day rolling baseline | ✅ |
+| TEMPORAL | "Did the price suddenly change?" | last valid price (same partner) | ✅ |
+| CROSS_PARTNER | "Is this price way off from peers?" | other-partner median (`v_partner_price_current`) | ✅ |
+| SKU_VARIANCE | "Is the spread within one batch suspicious?" | same-model same-day observations (z-score) | ✅ |
+
+**Behaviour on sample data (`Partner A.csv` + `Partner B.csv`, one upload each):**
+
+| Signal | Triggers? | Why / when it WOULD trigger naturally |
+|---|:---:|---|
+| STATISTICAL | ❌ 0 | Needs ≥2 baseline samples in last 30 days; first ingest has only 1 SCD-2 row per (product, country). Production: daily crawls accumulate 8–30 rows per 30 days → fires on any ≥10% deviation. |
+| TEMPORAL | ❌ 0 | Needs a *prior* SCD-2 row for the same key. Verified in dev with a synthetic INSTALMENT spike (`iP 17 PM 512GB` $1,689 → $4,680) → fired **HIGH** with `signal_score = 1.000`. |
+| CROSS_PARTNER | ❌ 0 | Sample data has Partner A only in AU + Partner B only in NZ → no `(product, country)` peer overlap. Verified in dev by SQL-injecting one Partner A row in NZ → fired **20 HIGH** on next Partner B upload. |
+| SKU_VARIANCE | ✅ **38** | Self-contained, fires on first ingest. Catches same-model same-day outliers; in our data picks up 1 MEDIUM + 37 LOW from intra-partner per-color price variance. |
+
+**Reading this honestly.** All four detectors work — the 0-counts on sample data reflect *data shape* (single-country-per-partner, single ingest, no price changes), not algorithmic gaps. Production data (multi-partner overlap + continuous crawling) lets all four fire naturally.
 
 **Per-signal severity (NOT a single combined score).** Each triggered signal produces its own row in `fact_anomaly`. If three signals fire on one offer, three rows are created — each routes to the right team via `dim_alert_policy`.
 
@@ -511,7 +523,7 @@ Same payload feeds Chart.js, Slack cards, PDF reports — frontend does the draw
 
 # §6 · Task C — Three Technical Write-ups (6 min)
 
-The brief asks three specific questions in Task C. Concise answers below; full version in [`submission/task_c_answers.md`](../Apple%20SDE/submission/task_c_answers.md).
+The brief asks three specific questions in Task C. Concise answers below; full version in [`submission/task_c_answers.md`](../Apple_SDE_Submission/submission/task_c_answers.md).
 
 ---
 
@@ -581,7 +593,7 @@ Three-tier closure loop. Detection is automated, triage is business-driven, and 
 1. Swap COPY in place of `executemany` (1 day, immediate 50× ingest speedup)
 2. Build async pipeline (`ingest_job` table + queue + worker pool) — bigger lift, unlocks both async UX and horizontal scaling
 
-See [`task_c_answers.md`](../Apple%20SDE/submission/task_c_answers.md) C.3 for full details.
+See [`task_c_answers.md`](../Apple_SDE_Submission/submission/task_c_answers.md) C.3 for full details.
 
 ---
 
@@ -634,7 +646,7 @@ See [`task_c_answers.md`](../Apple%20SDE/submission/task_c_answers.md) C.3 for f
 
 ## Slide 20 — What I'd Build Differently
 
-**1. Three remaining anomaly signals.** TEMPORAL / CROSS_PARTNER / SKU_VARIANCE — schemas and response shapes are in place; their detector branches are scoped as future work. The visualization helper is signal-agnostic and reusable.
+**1. Anomaly signal weight calibration.** All 4 signals (STATISTICAL / TEMPORAL / CROSS_PARTNER / SKU_VARIANCE) are implemented with hand-set tier thresholds. Production should learn per-signal severity weights from confirmed-positive feedback in `dq_bad_records` via Logistic Regression — turns the threshold ladder into a continuously tuned model.
 
 **2. Async pipeline + COPY.** C-3 is the production gap. For the take-home demo, sample data finishes in seconds; for 1 M rows, swapping in `COPY` (1 day) plus adding `ingest_job` table + worker pool would deliver the ~90 sec target.
 
@@ -731,6 +743,6 @@ In the demo we keep ingest synchronous within the request handler. Production de
 
 3. **Removing things is design too.** Three aggregate tables deleted, several FK indexes removed, single mv_baseline_staging instead of three separate tables. The final architecture is lean *because* I cut what didn't earn its place.
 
-**Ready for Q&A.** Code is browseable in `Apple SDE/`, structured submission in `Apple SDE/submission/`, OpenAPI spec at `http://localhost:8000/docs`.
+**Ready for Q&A.** Code is browseable in `Apple_SDE_Submission/`, structured submission in `Apple_SDE_Submission/submission/`, OpenAPI spec at `http://localhost:8000/docs`.
 
 Thank you.

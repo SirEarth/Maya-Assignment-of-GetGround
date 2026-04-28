@@ -280,7 +280,7 @@ Both paths invoke the same Python helpers — zero code duplication.
    - Both paths build the row from: country → ISO code (via `dim_country`); timestamp → UTC + market-local; FX rate frozen from `dim_currency_rate_snapshot` using `crawl_date`; `effective_total_local` + `effective_total_usd` computed; INSERT into `fact_price_offer` + child payment table (`fact_payment_full_price` or `fact_payment_instalment` per CTI design).
 6. **`run_semantic_dq`** — SEMANTIC-stage DQ (2 rules: low-confidence harmonise + category sanity bounds) on the freshly-written fact rows. **Failing rows STAY in fact** — these are *soft signals* where business judgment is required. Records flagged in `dq_bad_records` for review via `/bad-records`. Cross-row pricing patterns (variance, temporal jumps, cross-partner divergence) live in `/detect-anomalies`, not in DQ.
 7. **`update_scd2`** — SCD-2 history reconciliation (single CTE: latest → existing → changed → closed → insert) updates `fact_partner_price_history`.
-8. **`detect_anomalies_for_batch`** — STATISTICAL signal vs 30-day baseline from SCD-2 history; build visualization payload (series + band + cross-partner). Path A runs this inline; Path B runs it via `/detect-anomalies`.
+8. **`detect_anomalies_for_batch`** — runs all 4 signals (STATISTICAL vs 30-day baseline; TEMPORAL vs last valid price; CROSS_PARTNER vs peer-partner median via `v_partner_price_current`; SKU_VARIANCE z-score within same-model same-day group). Each detector writes its own row into `fact_anomaly` (`UNIQUE(offer_id, anomaly_type)` → one row per signal per offer). Path A runs this inline; Path B via `/detect-anomalies`.
 9. **`write_batch_summary`** — UPSERT into `dws_partner_dq_per_batch` (loaded_records, bad_records_count, harmonise stats). Idempotent; on Path B each endpoint refreshes the row at its tail so the summary fills incrementally.
 
 **Path A invocation order:** 1→2→3→4→5(gate=True)→6→7→8→9 inside one transaction.
@@ -313,7 +313,7 @@ Both paths invoke the same Python helpers — zero code duplication.
    - 两路径都做:国家 → ISO;时间戳 → UTC + 本地;FX 冷冻;`effective_total_local` + `effective_total_usd` 计算;INSERT `fact_price_offer` + payment 子表(CTI 设计)
 6. **`run_semantic_dq`** —— SEMANTIC 阶段 DQ(2 条软信号规则)于已写入 fact 行。**失败行保留在 fact 中**(软信号需业务判断),只标记。
 7. **`update_scd2`** —— SCD-2 历史协调(单 CTE)更新 `fact_partner_price_history`
-8. **`detect_anomalies_for_batch`** —— STATISTICAL signal vs 30 天基线;构建 visualization payload。Path A 内联跑,Path B 通过 `/detect-anomalies` 跑。
+8. **`detect_anomalies_for_batch`** —— 4 信号都跑(STATISTICAL vs 30 天基线 / TEMPORAL vs 上次价 / CROSS_PARTNER vs 其他 partner 中位价 via `v_partner_price_current` / SKU_VARIANCE 同 model 同日的 z-score)。每个 detector 各写一行进 `fact_anomaly`(`UNIQUE(offer_id, anomaly_type)` 保证每信号每 offer 一行)。Path A 内联跑,Path B 通过 `/detect-anomalies`。
 9. **`write_batch_summary`** —— UPSERT 到 `dws_partner_dq_per_batch`,幂等。Path B 每个端点尾部都跑一次,summary 增量填充。
 
 **Path A 调用顺序:** 1→2→3→4→5(gate=True)→6→7→8→9,单事务。

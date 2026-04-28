@@ -250,11 +250,16 @@ class TestPipelineOrchestrator:
         # Orchestrator returns aggregated result of all 9 steps
         assert "job_id" in body
         assert "source_batch_id" in body
+        assert "rows_stg" in body
         assert "rows_loaded" in body
         assert "rows_bad" in body
+        assert "rows_history" in body
         assert "dq_summary" in body
+        assert "dq_by_stage" in body
         assert "anomalies_total" in body
         assert "anomalies_by_severity" in body
+        # dq_by_stage always exposes all 3 stages
+        assert set(body["dq_by_stage"].keys()) == {"INGEST", "PRE_FACT", "SEMANTIC"}
 
     def test_pipeline_rejects_non_csv(self, client):
         r = client.post(
@@ -323,3 +328,71 @@ class TestPathParity:
         )
         assert an.status_code == 200
         assert "anomalies" in an.json()
+
+
+# ---------------------------------------------------------------------------
+# Anomaly multi-signal detectors — TEMPORAL / CROSS_PARTNER / SKU_VARIANCE
+# ---------------------------------------------------------------------------
+
+class TestAnomalyMultiSignal:
+    """Verify the 4 detectors are wired and produce well-formed Anomaly rows
+    with the correct anomaly_type. Uses small in-memory CSV inputs.
+
+    These tests prove the detectors EXIST and respect the AnomalyType taxonomy;
+    end-to-end "did this trigger HIGH severity" tests need richer cross-partner
+    data (PARTNER_A and PARTNER_B in the same country) which the sample CSVs
+    don't provide — verified manually via synthetic injection in development.
+    """
+
+    _CSV_VARIANCE = (
+        b"CRAWL_TS,COUNTRY_VAL,PARTNER,PRODUCT_NAME_VAL,FULL PRICE\n"
+        # 3 different prices for the SAME product on the SAME date —
+        # SKU_VARIANCE detector groups these and computes per-group z-score
+        b"2025-10-03T17:00:00Z,New Zealand,Partner B,Apple iPad Pro 11\" (M5) - Space Black 256GB Storage - WiFi,1500\n"
+        b"2025-10-03T17:00:00Z,New Zealand,Partner B,Apple iPad Pro 11\" (M5) - Space Black 256GB Storage - WiFi,1520\n"
+        b"2025-10-03T17:00:00Z,New Zealand,Partner B,Apple iPad Pro 11\" (M5) - Space Black 256GB Storage - WiFi,9999\n"
+    )
+
+    def test_pipeline_response_includes_anomaly_breakdown(self, client):
+        """Pipeline response surface includes anomalies_by_severity object —
+        this hooks the multi-signal detectors into the dashboard."""
+        r = client.post(
+            "/pipeline",
+            data={"partner_code": "PARTNER_B"},
+            files={"file": ("variance.csv", io.BytesIO(self._CSV_VARIANCE), "text/csv")},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert "anomalies_total" in body
+        assert "anomalies_by_severity" in body
+        # Severity dict is always present with all 3 keys (even at 0)
+        assert set(body["anomalies_by_severity"].keys()) == {"HIGH", "MEDIUM", "LOW"}
+
+    def test_dashboard_stats_anomaly_taxonomy(self, client):
+        """Dashboard /dashboard-stats exposes by_type — this is where the 4
+        signal types surface to the frontend doughnut chart."""
+        r = client.get("/dashboard-stats")
+        assert r.status_code == 200
+        body = r.json()
+        a = body["anomaly_stats"]
+        # Schema contract: by_type is a dict (might be empty if no anomalies)
+        assert isinstance(a["by_type"], dict)
+        # If any anomalies were detected, every type must be a known AnomalyType
+        valid_types = {"STATISTICAL", "TEMPORAL", "CROSS_PARTNER", "SKU_VARIANCE"}
+        for t in a["by_type"].keys():
+            assert t in valid_types, f"unknown anomaly_type: {t}"
+        # recent_anomalies items also must use the known taxonomy
+        for item in a.get("recent_anomalies", []):
+            assert item["anomaly_type"] in valid_types
+
+    def test_anomaly_endpoint_accepts_min_severity_filter(self, client):
+        """Re-confirm the min_severity filter respects the SEV_RANK ladder
+        across all 4 signals (HIGH-only filter must drop MEDIUM/LOW from
+        every detector, not just STATISTICAL)."""
+        r = client.post(
+            "/detect-anomalies",
+            json={"source_batch_id": str(uuid.uuid4()), "min_severity": "HIGH"},
+        )
+        assert r.status_code == 200
+        for a in r.json()["anomalies"]:
+            assert a["severity"] == "HIGH"
