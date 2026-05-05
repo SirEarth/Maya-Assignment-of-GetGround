@@ -627,31 +627,7 @@ Three-tier closure loop. Detection is automated, triage is business-driven, and 
 
 ---
 
-## Slide 21 — Q&A Cheat Sheet
-
-**Likely deep-dive questions and where the answer lives:**
-
-| Question | Where to look |
-|----------|---------------|
-| Why an orchestrator (`/pipeline`) AND 4 sub-modules? Isn't that redundant? | Same 9 helpers, different orchestration. Sub-modules satisfy Task B's literal "4 independent endpoints"; orchestrator recovers hard PRE_FACT gating that's only possible in single-transaction sequential execution. Demonstrable cleanliness difference in `fact_price_offer`. |
-| Path A vs Path B — observable difference? | Same CSV: Path A → fact clean (gate filtered bad rows). Path B → fact contains flagged rows; analytics need `LEFT JOIN dq_bad_records WHERE bad_record_id IS NULL`. |
-| Why CTI not JSONB for payment? | `schema.sql` SECTION 2 (above `payment_type_enum`) |
-| Why monthly partition not daily? | `schema.sql` partitioning block (~line 470) |
-| Why three DQ stages, not two? | `task_b_answers.md` B.1 + `task_c_answers.md` C.2 |
-| Why SCD-2 not SCD-1? | `schema.sql` `fact_partner_price_history` block |
-| Why structured matching, not embeddings? | `harmonise/scorer.py` docstring + `task_b_answers.md` B.4 |
-| Why FX rate frozen per fact row? | `schema.sql` `fact_price_offer.fx_rate_date` comment |
-| Why event-driven `dws_partner_dq_per_batch`? | `schema.sql` `dws_partner_dq_per_batch` block |
-| How does anomaly suppression work? | `dim_market_event` + `fact_anomaly.suppression_*` columns |
-| How would you calibrate weights? | Logistic Regression over labelled anomalies, with `dim_anomaly_threshold` storing source = 'data_calibrated' |
-| Show me a HIGH severity anomaly | Run `/detect-anomalies` in Swagger UI (after injecting baseline per `demo_queries.sql` §5) |
-| What if a partner cuts data feed? | Replay via `source_batch_id` — surgical, not full reload |
-| What if Partner C is JSON? | Add a parser at `_step1_csv_to_staging`; downstream pipeline reads `stg_price_offer` so unchanged |
-| What if Apple ships a new product line (Vision Pro)? | `task_c_answers.md` C.1 — Catalog team adds to Product Reference, re-seed `dim_product_model`, replay batch |
-
----
-
-## Slide 22 — Closing
+## Slide 21 — Closing
 
 **Three takeaways:**
 
