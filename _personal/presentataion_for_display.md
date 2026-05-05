@@ -363,6 +363,8 @@ POST /detect-anomalies
 - `iP 17 PM 512GB` → `iPhone 17 Pro Max 512GB` (HIGH 0.946)
 - `iP15P 128` → `iPhone 15 Pro 128GB` (HIGH 0.845, no "GB" suffix)
 - `Apple iPad Air 13-inch (M3) - Starlight 256GB Storage - WiFi` → same canonical model
+
+```
                   raw partner name
                   "iP 17 PM 512GB"
                           │
@@ -390,7 +392,7 @@ POST /detect-anomalies
                          │
                          ▼
               combined score → HIGH/MEDIUM/LOW
-
+```
 
 
 **Three-signal hybrid scorer:**
