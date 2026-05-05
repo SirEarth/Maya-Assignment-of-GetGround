@@ -363,6 +363,35 @@ POST /detect-anomalies
 - `iP 17 PM 512GB` → `iPhone 17 Pro Max 512GB` (HIGH 0.946)
 - `iP15P 128` → `iPhone 15 Pro 128GB` (HIGH 0.845, no "GB" suffix)
 - `Apple iPad Air 13-inch (M3) - Starlight 256GB Storage - WiFi` → same canonical model
+                  raw partner name
+                  "iP 17 PM 512GB"
+                          │
+                          ▼
+                  ┌───────────────┐
+                  │  normalise()  │   预处理:小写、标点清洗、缩写展开、噪声词
+                  └───────┬───────┘   去掉 → 干净 token 列表
+                          │
+              ['iphone','17','pro','max','512','gb']
+                          │
+              ┌───────────┴────────────┐
+              ▼                         ▼
+        ┌──────────┐           ┌──────────────┐
+        │ extract()│           │ tokens 原样  │
+        └────┬─────┘           └──────┬───────┘
+             │ 结构化属性               │ 原始 token list / 文本
+             ▼                          ▼
+        ┌─────────────────────────────────────────┐
+        │   3 个独立信号 vs Reference 库每条      │
+        ├─────────────────────────────────────────┤
+        │ ① attr_match    × 0.5  (主导)          │
+        │ ② token_jaccard × 0.3                   │
+        │ ③ char_fuzz     × 0.2  (兜底)          │
+        └────────────────┬────────────────────────┘
+                         │
+                         ▼
+              combined score → HIGH/MEDIUM/LOW
+
+
 
 **Three-signal hybrid scorer:**
 ```
