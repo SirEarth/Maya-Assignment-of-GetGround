@@ -98,30 +98,14 @@ Both paths invoke the **same 9 internal step helpers** in `api/services.py` — 
 
 ---
 
-## Slide 4 — Live Demo Plan (Swagger UI + VSCode)
+## Slide 4 — Live Demo Plan (Swagger UI + HDML)
 
-**Goal:** show the full pipeline end-to-end on real PostgreSQL — entirely in the browser via Swagger UI, plus VSCode for SQL inspection. **No terminal / curl needed.**
+./start.sh reset
+curl -s -X POST http://localhost:8000/pipeline -F "file=@Partner A.csv" -F "partner_code=PARTNER_A" > /dev/null
+curl -s -X POST http://localhost:8000/pipeline -F "file=@Partner B.csv" -F "partner_code=PARTNER_B" > /dev/null
 
-| Step | Where | What |
-|---|---|---|
-| 1 | Browser (Swagger UI) | Scroll through all 9 endpoints; explain dual-path (Path A `/pipeline` + Path B 4 Task-B sub-modules). Pydantic auto-generated. |
-| 2 | Swagger UI → **`POST /pipeline`** | Path A demo: "Try it out" → upload `Partner A.csv` + `partner_code=PARTNER_A` → Execute. Single response includes `dq_summary` + `anomalies_total`. Copy `source_batch_id`. |
-| 3 | Swagger UI → **`POST /load-data`** then **`/compute-dq`** then **`/detect-anomalies`** | Path B demo: same 9 steps in three calls. Tell **NZ story** during `/load-data` upload of `Partner B.csv` (154 rows; resolver fix; replay loop). Use the `/compute-dq` response to show post-hoc flagging — bad rows ARE in fact, just labelled. |
-| 4 | Browser → `results_showcase.html` | Open the static visual dashboard; walk through the cards: headline numbers → pipeline funnel (with the 9 Apple Watch SKUs blocked story) → harmonise confidence pie → DQ pass-rate bars → anomaly time-series with band → sample harmonise breakdowns → sample bad records → NZ 154-rows iteration story |
-| 5 | (Optional) VSCode Database Panel | One quick `demo_queries.sql §0` sanity check to prove the dashboard reflects live DB, not a pre-rendered mock. Other SQL sections kept as drill-down for Q&A follow-ups. |
-
-**Expected baseline numbers after both uploads:**
-
-| Table | Rows |
-|---|---:|
-| `stg_price_offer` | ~4 208 |
-| `fact_price_offer` | ~4 174 |
-| `fact_payment_full_price` / `fact_payment_instalment` | 1 066 / 3 108 |
-| `fact_partner_price_history` | ~120 |
-| `dq_bad_records` | ~77 |
-| `dq_output` | 26 (= 2 batches × 13 rules) |
-
-**Punchline to land at end:** *"Notice the funnel — every stg row preserved with `raw_payload`, but only PRE_FACT-passing rows enter `fact_price_offer`. Anything HIGH severity is blocked here. So `SELECT * FROM fact_price_offer` is safe to query directly — analytics never need a filter view."*
+http://localhost:8000/docs
+./start.sh wipe
 
 ---
 
@@ -179,13 +163,6 @@ Both paths invoke the **same 9 internal step helpers** in `api/services.py` — 
 │  ▸ DWS:             materialized view + summary tables             │
 └────────────────────────────────────────────────────────────────────┘
 ```
-
-**Why this split:**
-- **API layer** offers two paths over the same logic. Path A (`/pipeline`) is the one-click orchestrator with strict gating. Path B (4 Task-B sub-modules) provides independently callable endpoints — what the assignment literally specifies. Pydantic auto-validates and auto-generates OpenAPI.
-- **Service layer** holds the **9 shared step helpers** plus the entry points that orchestrate them. Both paths call the same helper functions — zero code duplication; the only difference is orchestration order and the `gate` parameter to `write_stg_to_fact`.
-- **Data layer** is PostgreSQL with a 29-table star schema; asyncpg pool gives concurrent queries without thread overhead.
-
----
 
 ## Slide 6 — Business Pipeline (9 Steps · Two Call Paths)
 
@@ -248,8 +225,6 @@ Both paths invoke the **same 9 internal step helpers** in `api/services.py` — 
    fact_anomaly → dim_alert_policy routing → Slack HIGH / Email MED / UI LOW
 ```
 
-**Key design call:** the 9 steps run as helper functions in `api/services.py`. **Path A** invokes them in interleaved order inside one PostgreSQL transaction — any failure rolls back the whole batch; the PRE_FACT gate at step 5 keeps bad rows out of fact. **Path B** invokes them in grouped order across three transactions — Task B's literal contract of 4 independently callable endpoints; the gate degrades to post-hoc flagging in `dq_bad_records`. Both paths cover all 9 logical steps — same code, different orchestration.
-
 **Three DQ stages, three policies:**
 
 | Stage | Where | Policy | Why |
@@ -283,17 +258,6 @@ The assignment specifies **five requirements** for Task A. Each maps to a delibe
 | ENUM types | 4 | `payment_type_enum` · `harmonise_confidence_enum` · `bad_record_status_enum` · `product_lifecycle_enum` |
 | Partitioning | RANGE by month | on `crawl_ts_utc` for `fact_price_offer` and its CTI children |
 | Aggregation | A+MV hybrid | materialised view feeding the baseline summary table |
-
-**Why these particular choices and not the obvious alternatives?**
-
-| Alternative | Why we rejected it |
-|---|---|
-| Sparse columns for payment | Wastes storage, prevents NOT NULL / CHECK constraints on payment-specific fields, explicitly forbidden by the brief |
-| JSONB for payment payload | Database can't enforce schema on `payment_details` JSONB; loses SQL type safety; index path queries are awkward |
-| SCD-1 (overwrite-in-place) | Loses history — anomaly detection's 30-day rolling baselines would have nothing to read |
-| One unified DQ table (no catalog / output split) | Aggregate dashboards (per-rule pass rate trend) become slow joins; per-record audit explodes the table; we want both grains |
-
-The next two slides expand the two highest-leverage choices: **Star Schema** (Slide 8) and **SCD-2 + Aggregate Hybrid** (Slide 9). The full clean schema for submission lives in `submission/task_a_schema.sql` (758 lines).
 
 ---
 
@@ -366,8 +330,6 @@ dws_product_price_baseline_1d
         ▼
 POST /detect-anomalies
 ```
-
-**Why hybrid:** MV keeps logic in plain SQL (reviewable, testable); physical table preserves history (yesterday's baseline isn't overwritten); write-time dedup avoids storing identical rows day after day.
 
 ---
 
@@ -462,12 +424,6 @@ score = 0.5 × attribute_match    (structured: category, storage, chip, model)
 | **PRE_FACT** | enriched `stg_price_offer` | 3 | **HIGH-severity gate** — row blocked from fact | Country↔currency, partner↔country, harmonise unmatched |
 | **SEMANTIC** | `fact_price_offer` | 2 | Row stays in fact, flagged | Harmonise low confidence, category sanity bounds |
 
-**Why a PRE_FACT gate.** Without it, factual errors land in `fact_price_offer` and downstream analytics need filter views to exclude unresolved HIGH severity records. With the gate, `SELECT * FROM fact_price_offer` is safe to query directly.
-
-**Why SEMANTIC stays small + soft.** Only single-row data-quality concerns that need business judgment live here — low confidence might be a new product (add to dictionary), category-band violations might be real promotions (don't auto-discard). Cross-row pricing patterns (variance, duplicates, temporal jumps) belong in `/detect-anomalies`, not in DQ.
-
-**Implementation:** every rule is a PL/pgSQL function returning `(row_ref, failed_field, error_message, raw_payload)`. **One DB call replaces 13 M Python checks** at 1 M-row scale.
-
 **Business-user closure (Task C-2):**
 ```
 NEW  →  IN_REVIEW  →  RESOLVED (replay batch) | IGNORED
@@ -497,16 +453,19 @@ NEW  →  IN_REVIEW  →  RESOLVED (replay batch) | IGNORED
 | CROSS_PARTNER | ❌ 0 | Sample data has Partner A only in AU + Partner B only in NZ → no `(product, country)` peer overlap. Verified in dev by SQL-injecting one Partner A row in NZ → fired **20 HIGH** on next Partner B upload. |
 | SKU_VARIANCE | ✅ **38** | Self-contained, fires on first ingest. Catches same-model same-day outliers; in our data picks up 1 MEDIUM + 37 LOW from intra-partner per-color price variance. |
 
-**Reading this honestly.** All four detectors work — the 0-counts on sample data reflect *data shape* (single-country-per-partner, single ingest, no price changes), not algorithmic gaps. Production data (multi-partner overlap + continuous crawling) lets all four fire naturally.
-
-**Per-signal severity (NOT a single combined score).** Each triggered signal produces its own row in `fact_anomaly`. If three signals fire on one offer, three rows are created — each routes to the right team via `dim_alert_policy`.
-
 **Contextual adjustments stored per row:**
 - `lifecycle_factor` — NEW / STABLE / LEGACY / EOL moderates threshold
 - `event_suppression_factor` — `dim_market_event` (Apple launch / Black Friday) suppresses known volatility
 - `category_sensitivity` — wider tolerance for high-volatility categories (AirPods)
 
 **All thresholds in `dim_anomaly_threshold`** — config-driven, no magic numbers; Logistic Regression calibration plan documented.
+
+**Implementation honesty — partial wiring.** Schema and per-row snapshot
+columns are complete; detection code currently hardcodes `lifecycle_factor=1.0`,
+`suppression_applied=False`, and severity bars (`SEV_BAR_*` constants) instead of
+querying `dim_anomaly_threshold` / `dim_product_lifecycle` / `dim_market_event`.
+Plumbing the dim-table lookups is ~0.5 day — the replay-safety snapshot
+mechanism is already correct, so only the source-of-values changes.
 
 **Visualization payload (decoupled from rendering):**
 ```json
@@ -540,8 +499,6 @@ The Kimball star schema isolates partner change to a **single dimension row**. F
 | **New country** | `INSERT INTO dim_country` (+ `dim_timezone` if a new IANA zone) | **None on facts.** |
 | **Unknown product category in partner feed** | Detected by `DQ_HARM_002` (PRE_FACT gate) → `dq_bad_records` → business review. If legitimate, Apple catalog team adds to Product Reference, then `INSERT INTO dim_product_category`, replay batch. **Never auto-discovered.** | **None on facts.** Bad rows never reach `fact_price_offer`. |
 
-**The takeaway.** Dimensions are designed to absorb business change; fact schemas stay stable for years. New partners onboard via configuration, not migrations — that is the star-schema's primary payoff.
-
 ---
 
 ## Slide 16 — Task C-2: Error Handling + Data Quality Strategy
@@ -567,8 +524,6 @@ Three-tier closure loop. Detection is automated, triage is business-driven, and 
 **Tier 3 — Learning loop**
 - Resolved records feed back: harmonise dictionary additions (Layer 3), threshold tuning in `dim_anomaly_threshold`, new DQ rules when patterns emerge.
 
-**Real example — the 154-row NZ story.** Partner B shipped 154 rows with `COUNTRY_VAL = "NZ"` (ISO code, not full name `"New Zealand"`). `DQ_FMT_001` flagged them. Reviewer saw both forms are legitimate; resolver was hardcoded to full names. Fix: extend `_COUNTRY_NAME_MAP` to accept ISO codes; replay; **all 154 rows promoted to fact_price_offer cleanly.** **DQ → rule iteration → replay loop in action.**
-
 ---
 
 ## Slide 17 — Task C-3: Scaling to 1 M Records
@@ -585,16 +540,6 @@ Three-tier closure loop. Detection is automated, triage is business-driven, and 
 | 4 | Reference data cached in-memory (zero per-row DB lookups) | ✅ Partial | done (Harmoniser + country/currency dicts) |
 | 5 | Bulk Slowly Changing Dimension Type 2 update via single CTE | ✅ Implemented | done |
 
-**Performance targets:**
-- 1 M rows: 3–7 hours → **~90 seconds** (~200×)
-- 10 M rows: feasible in ~15 minutes with partition-aware sharding
-
-**Migration path is incremental:**
-1. Swap COPY in place of `executemany` (1 day, immediate 50× ingest speedup)
-2. Build async pipeline (`ingest_job` table + queue + worker pool) — bigger lift, unlocks both async UX and horizontal scaling
-
-See [`task_c_answers.md`](../Apple_SDE_Submission/submission/task_c_answers.md) C.3 for full details.
-
 ---
 
 # §7 · Reflection (8 min)
@@ -602,8 +547,6 @@ See [`task_c_answers.md`](../Apple_SDE_Submission/submission/task_c_answers.md) 
 ---
 
 ## Slide 18 — Challenges & Iterations
-
-**Things that turned out harder than expected:**
 
 1. **Schema iteration.** First draft used a wide table with sparse payment columns; assignment explicitly forbids sparse — refactored to **Class Table Inheritance**. DQ started as 2 stages (INGEST + SEMANTIC); during integration testing realised "fact has invalid country/currency rows" → added **PRE_FACT gate**.
 
@@ -613,50 +556,39 @@ See [`task_c_answers.md`](../Apple_SDE_Submission/submission/task_c_answers.md) 
 
 3. **Real-world dirt the spec hides.** Discovered Partner B has 154 rows where `COUNTRY_VAL = "NZ"` (ISO code, not full name). DQ engine flagged them; root cause was the resolver only accepting full names. **Real DQ → rule iteration → replay loop.**
 
-4. **SCD-2 same-day boundary.** Re-running tests hit `valid_from > valid_to` constraint failures when an observation arrived on the same day as an existing history row's valid_from. Fixed by adding a same-day guard in the change-detection CTE.
+4. **Threshold calibration is the silent killer.** First draft had hand-picked weights (`0.4 / 0.3 / 0.3`). Fixed by introducing `dim_anomaly_threshold` with documented calibration plans (Logistic Regression for weights; percentiles for thresholds; A/B testing for suppression factors).
 
-5. **Threshold calibration is the silent killer.** First draft had hand-picked weights (`0.4 / 0.3 / 0.3`). Fixed by introducing `dim_anomaly_threshold` with documented calibration plans (Logistic Regression for weights; percentiles for thresholds; A/B testing for suppression factors).
-
-6. **Removing things is design too.** Dropped 3 aggregate tables that didn't earn their keep (`dws_price_offer_market_local_1d`, `dws_price_offer_td`, `dws_cross_partner_comparison_1d`) once I confirmed no API endpoint needed them.
+5. **Removing things is design too.** Dropped 3 aggregate tables that didn't earn their keep (`dws_price_offer_market_local_1d`, `dws_price_offer_td`, `dws_cross_partner_comparison_1d`) once I confirmed no API endpoint needed them.
 
 ---
 
 ## Slide 19 — Design Highlights I'm Proud Of
 
-**1. Orchestrator + sub-modules with shared 9 helpers.** Task B requires 4 independently callable endpoints — that's Path B. But hard PRE_FACT gating fundamentally needs single-process sequential execution, so I added `POST /pipeline` as the orchestrator (Path A). Both paths invoke the **same 9 helper functions** in `api/services.py` — zero duplication; the only difference is orchestration order and the `gate` flag passed to `write_stg_to_fact`. Honest trade-off: Path A trades flexibility for stronger guarantees; Path B trades guarantees for granular control.
+**1. Orchestrator + sub-modules with shared 9 helpers.** 
 
-**2. Three-stage DQ with severity-driven policy.** The architectural call I'd defend in any review:
-   - INGEST stops at staging (parse errors)
-   - PRE_FACT blocks factual errors from entering fact (Path A) or flags post-hoc (Path B)
-   - SEMANTIC flags soft signals after fact write
+**2. Three-stage DQ with severity-driven policy.** 
 
-   **Result:** on Path A, `fact_price_offer` is trustworthy by construction — downstream analytics queries don't need filter views. On Path B, analytics use `LEFT JOIN dq_bad_records WHERE bad_record_id IS NULL` to filter; demonstrates why the orchestrator is worth the extra endpoint.
+**3. Explainable harmonise.** Three signals + structured override → every match has a transparent breakdown. Business reviewers can see *why* the matcher decided something, which is invaluable for triage. Vector embeddings would have been a black box.
 
-**3. DQ rules are PL/pgSQL functions.** 13 rules executed in PostgreSQL, not Python. **One DB call replaces 13 M Python checks** at 1 M rows. Plus: `dq_rule_catalog` is metadata-driven — adding a rule = one INSERT, no code change.
+**4. `fact_anomaly` one-row-per-signal (not per-offer).** An offer that trips multiple signals appears as multiple rows, each routable to a different team. Combining them into a composite would dilute or hide individual concerns.
 
-**4. Explainable harmonise.** Three signals + structured override → every match has a transparent breakdown. Business reviewers can see *why* the matcher decided something, which is invaluable for triage. Vector embeddings would have been a black box.
-
-**5. Visualization payload decoupled from rendering.** `/detect-anomalies` returns structured JSON, not images. Same payload feeds Chart.js dashboards, Slack alert cards, PDF reports — three consumers from one definition.
-
-**6. `fact_anomaly` one-row-per-signal (not per-offer).** An offer that trips multiple signals appears as multiple rows, each routable to a different team. Combining them into a composite would dilute or hide individual concerns.
-
-**7. Adapting to a new partner is a configuration change, not a migration.** Adding Partner C = `INSERT INTO dim_partner`; new payment type = ALTER TYPE + new CTI child; new country = `INSERT INTO dim_country`. Star-schema decoupling pays off (full table on Slide 15 / Task C-1).
+**5. Adapting to a new partner is a configuration change, not a migration.** Adding Partner C = `INSERT INTO dim_partner`; new payment type = ALTER TYPE + new CTI child; new country = `INSERT INTO dim_country`. Star-schema decoupling pays off (full table on Slide 15 / Task C-1).
 
 ---
 
 ## Slide 20 — What I'd Build Differently
 
-**1. Anomaly signal weight calibration.** All 4 signals (STATISTICAL / TEMPORAL / CROSS_PARTNER / SKU_VARIANCE) are implemented with hand-set tier thresholds. Production should learn per-signal severity weights from confirmed-positive feedback in `dq_bad_records` via Logistic Regression — turns the threshold ladder into a continuously tuned model.
+**1. Anomaly signal weight calibration.** 
 
-**2. Async pipeline + COPY.** C-3 is the production gap. For the take-home demo, sample data finishes in seconds; for 1 M rows, swapping in `COPY` (1 day) plus adding `ingest_job` table + worker pool would deliver the ~90 sec target.
+**2. Async pipeline + COPY.** 
 
-**3. Harmonise Layer 2 — data-driven mining.** Currently only Layer 1 (manual dictionary) and Layer 3 (business loop). Layer 2 (TF-IDF + N-gram co-occurrence over Product Ref Long/Short Description alignment) is scaffolded but not implemented.
+**3. Harmonise Layer 2 — data-driven mining.** 
 
-**4. Sentence-transformer fallback.** Pluggable via `score_fn="embedding"` — not enabled because at 281 reference rows it adds dependency without measurable benefit. Worth revisiting if Reference grows 10×.
+**4. Sentence-transformer fallback.** 
 
-**5. Real-time alerting via Kafka / Webhooks.** Current design has Postgres `LISTEN/NOTIFY` trigger as a placeholder pattern; production would be Kafka producer or webhook fan-out via `dim_alert_channel`.
+**5. Real-time alerting via Kafka / Webhooks.** 
 
-**6. Observability — `ingest_job` + Prometheus metrics.** Currently relies on `dws_partner_dq_per_batch` for batch-level KPIs. Production would add per-job duration / chunk progress / retry counts to a dedicated metrics endpoint.
+**6. Observability — `ingest_job` + Prometheus metrics.** 
 
 ---
 
@@ -688,52 +620,7 @@ See [`task_c_answers.md`](../Apple_SDE_Submission/submission/task_c_answers.md) 
 
 ---
 
-## Slide 22 — Technical Glossary
-
-### Q1 — How does a country value flow through the pipeline?
-
-```
-Partner CSV value: "NZ" or "New Zealand"
-        ▼
-   _COUNTRY_NAME_MAP  (services.py)
-       "NZ"          → "NZ"
-       "New Zealand" → "NZ"
-        ▼
-   stg_price_offer.country_code = 'NZ'
-        ▼
-   fact_price_offer.country_code = 'NZ'
-```
-
-Fact tables store ISO codes (2 chars vs 11) for storage efficiency at scale; presentation layer joins `dim_country` for the human-readable name.
-
-### Q2 — JSONB and ENUM, when?
-
-| JSONB use case | Why |
-|---|---|
-| `dq_bad_records.raw_payload` | Preserves the full original CSV row even if columns failed to parse |
-| `fact_anomaly.threshold_snapshot` | Freezes `dim_anomaly_threshold` values at detection time (replay-safe) |
-| `fact_anomaly.baseline_snapshot` | Freezes the per-product baseline used at detection |
-
-| ENUM | Used in |
-|---|---|
-| `payment_type_enum` | CTI discriminator |
-| `harmonise_confidence_enum` | Score-bucket label |
-| `bad_record_status_enum` | Workflow state |
-| `product_lifecycle_enum` | Anomaly sensitivity per product |
-
-**Why ENUM beats VARCHAR + CHECK:** typo rejection at engine level; 4-byte storage; ordered (NEW < STABLE < LEGACY < EOL).
-
-### Q3 — Async queue, Pydantic 2, asyncpg
-
-- **Pydantic 2** — data validation library (Rust core, 5–50× faster than 1.x). Defines request/response shapes; auto-validates inputs; powers the `/docs` schema.
-- **asyncpg** — non-blocking PostgreSQL driver for `asyncio`. ~1000 connections per worker (vs ~10 in psycopg2); 3–5× faster.
-- **Async queue** — "to-do list" producers append to and workers consume from (Redis / SQS / RabbitMQ / Kafka). Decouples HTTP request from work; enables horizontal scaling; supports retry semantics + back-pressure.
-
-In the demo we keep ingest synchronous within the request handler. Production design (C-3) uses S3 + SQS + worker pool.
-
----
-
-## Slide 23 — Closing
+## Slide 22 — Closing
 
 **Three takeaways:**
 
@@ -742,7 +629,5 @@ In the demo we keep ingest synchronous within the request handler. Production de
 2. **The DQ split is the architectural payoff.** INGEST → PRE_FACT gate → SEMANTIC isn't in the spec — it emerged from real integration testing. The result: `fact_price_offer` is trustworthy by construction. Downstream analytics never need filter views.
 
 3. **Removing things is design too.** Three aggregate tables deleted, several FK indexes removed, single mv_baseline_staging instead of three separate tables. The final architecture is lean *because* I cut what didn't earn its place.
-
-**Ready for Q&A.** Code is browseable in `Apple_SDE_Submission/`, structured submission in `Apple_SDE_Submission/submission/`, OpenAPI spec at `http://localhost:8000/docs`.
 
 Thank you.
