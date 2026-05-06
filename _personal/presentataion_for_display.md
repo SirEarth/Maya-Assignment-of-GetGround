@@ -102,9 +102,11 @@ Both paths invoke the **same 9 internal step helpers** in `api/services.py` — 
 
 ./start.sh reset
 curl -s -X POST http://localhost:8000/pipeline -F "file=@Partner A.csv" -F "partner_code=PARTNER_A" > /dev/null
+
 curl -s -X POST http://localhost:8000/pipeline -F "file=@Partner B.csv" -F "partner_code=PARTNER_B" > /dev/null
 
 http://localhost:8000/docs
+
 ./start.sh wipe
 
 ---
